@@ -100,7 +100,9 @@ Read the full list of twelve before touching `build.zig`:
 - `tools/sync-ndk.sh` is the enforcer for the NDK-owned facts: it re-resolves
   the release identity, verifies the SHA-256 in `tools/ndk.sha256`, and diffs
   `src/ndk.zig`'s table against a freshly parsed `meta/abis.json`, exiting
-  non-zero on any change. Run it read-only before and after touching that table.
+  non-zero on any change. Run it read-only before and after touching that
+  table, or run `zig build sync-ndk`, which is the same script as a gate and
+  is what CI runs.
   `--accept` re-records the hash and **does not** update `src/ndk.zig` or
   `root.zig` — that work is yours. It cannot check the libc paths file format;
   that is a compiler fact, watched only by a compiler bump (`CHANGELOG.md`
@@ -126,19 +128,31 @@ Gates are owned by `build.zig` and documented in `README.md` §Gates.
   `std.Target.Query` resolves and the package compiles for it. The binaries
   are never run. Needs no NDK.
 - **libc link — `zig build ndk-link-check`.** Establishes that Zig links a
-  real bionic Android executable against a real sysroot. **Needs an NDK.**
+  real bionic Android executable against a real sysroot, and that the
+  installed artefact is an ELF for the requested ABI. **Needs an NDK.**
+- **pin check — `zig build sync-ndk`.** Establishes that the release
+  identity, the archive hash and the copied ABI table still describe the NDK
+  in front of it (§4). **Needs an NDK**: finding none, the step depends on a
+  failing step naming every source it tried, exactly as the link gate does.
 - **local aggregate — `zig build check`.** `test` plus `ndk-abi-check`. Needs
   no NDK. **CI does not run this step** (§8): the workflow runs those two
   halves as two jobs, because one job per gate is one red gate per failure.
-- **everything — `zig build all`.** The above, plus `fmt-check` and the
-  bionic link. Needs an NDK.
+- **everything — `zig build all`.** `check`, plus `fmt-check`, the bionic link
+  and the pin check. Needs an NDK.
+
+Every row above was observed on this host on 2026-10-05 against NDK r29. The
+per-gate figures and the link artefact are recorded in `README.md` §Gates;
+that table is the measurement and this list is only its summary, so a re-run
+supersedes it rather than this paragraph.
 
 **Hard rule: `test` and `check` must pass on a machine with no NDK installed and
 no `ANDROID_NDK_*` set.** A consumer who fetches this package may have neither,
 and a host gate that needs a sysroot is a gate nobody can run. Only
-`ndk-link-check` may require an NDK, and a missing NDK must not abort
-configuration. Every test builds the tree it asserts against; no test may
-require a real NDK installation, and none may skip itself silently either.
+`ndk-link-check` and `sync-ndk` may require an NDK, and a missing NDK must not
+abort configuration — both hang a failing `Step.Fail` carrying the ordered
+list of sources they tried, so `zig build all` still configures and still
+refuses. Every test builds the tree it asserts against; no test may require a
+real NDK installation, and none may skip itself silently either.
 
 `zig build test -Dtarget=<foreign>` compiles the tests and does not run them;
 the build prints that it is doing so. `ndk-abi-check` is the cross-target gate.
@@ -151,7 +165,9 @@ it per ABI when you touch path construction — `-Dabi=<name>`, and
 established by probe, and not "this ABI is covered".
 
 After any change to `build.zig`, `src/*.zig` or `root.zig`: `zig build check`
-and `zig build fmt-check`, plus `tools/sync-ndk.sh` if the ABI table moved.
+and `zig build fmt-check`. If the ABI table moved, also `zig build sync-ndk`,
+which is the same script as a gate and needs an NDK — on a host that has none,
+run `tools/sync-ndk.sh` directly instead.
 
 ## 6. Style
 
@@ -180,6 +196,17 @@ and `zig build fmt-check`, plus `tools/sync-ndk.sh` if the ABI table moved.
   `Ndk.Probes`, which exists only to be freed on a discovery failure, and
   `LibcPaths`, whose `deinit` frees exactly the three paths `forAndroid`
   copied. **No `deinit` means "owns nothing", never "nothing to free."**
+- **Test with `std.testing.allocator`, not an arena, whenever the question is
+  a `free`.** The two catch different bugs. The checking allocator catches
+  leaks *and* size mismatches; an arena swallows a short free silently,
+  because `free` on arena-backed memory is a no-op, so an all-arena suite
+  cannot see one at all. `Ndk.probeCandidates` freed its canonical root one
+  byte short on every call where the root existed on disk — `realPathFileAlloc`
+  returns `[:0]u8`, allocating n+1 bytes, and the `[]u8` peer is handed the
+  peeled length — and every call site here used an arena, so it stayed green.
+  Use an arena only where leaking is the point; the one place that earns it is
+  `std.zig.LibCInstallation`, whose `deinit` is broken at this compiler line
+  (`parseRendered` in `src/libc_file.zig`).
 - Match the code that is there. `src/` has one house style; do not introduce a
   second one inside one file.
 
@@ -248,15 +275,22 @@ One of the two items it owed is discharged. The other is not.
   `cross` job's coverage as link coverage: compiling for an ABI and linking
   against its sysroot paths are the two claims this package keeps apart
   everywhere else.
-- **CI runs the two halves of `check` separately**, never `zig build check`
-  itself — `zig build fmt-check` is the `fmt` job, `zig build test` the `test`
-  job, `zig build ndk-abi-check` the `cross` job. Four of the five jobs
-  provision no NDK and assert nothing about one; only `link` fetches it.
-- **Those jobs are configured, not observed.** This repository has never been
-  pushed through the workflow, so no CI run stands behind any claim about one.
-  Write "CI runs `X`", never "CI is green". What *is* observed is local: on
-  this host `zig build test` passes with no NDK installed and no
-  `ANDROID_NDK_*` set, which is the property the `fmt`, `test` and `cross` jobs
-  are wired to exercise. `ndk-abi-check` and `ndk-link-check` need an
-  observation of their own before this package may say more about them than
-  their mechanism.
+- **CI runs five gate steps across five jobs, never `zig build check` itself.**
+  `fmt-check` is the `fmt` job, `test` the `test` job, `ndk-abi-check` the
+  `cross` job, and `link` runs two — `sync-ndk`, then `ndk-link-check`, in
+  that order, because the pin is only worth checking against the sysroot the
+  link will then use. Three of those five are gates `check` does not contain:
+  `fmt-check`, `sync-ndk` and `ndk-link-check`. Four of the five jobs provision
+  no NDK and assert nothing about one; only `link` fetches it. The fifth job,
+  `licence`, is item 8's shell gate and runs no build step at all.
+- **Every gate has been observed locally; CI itself never has.** This is the
+  distinction worth keeping and the easy one to get backwards. Observed on
+  this host on 2026-10-05 against NDK r29: every row of `README.md` §Gates
+  exits 0, and the link gate installs `zig-out/bin/ndk-link-check`, which
+  `file(1)` reads as an aarch64 Android PIE with interpreter
+  `/system/bin/linker64`, built by NDK r29. The bionic link is established,
+  not predicted. That table is the record: re-read it rather than re-deriving
+  it, and re-run a gate rather than quoting this paragraph, which summarises
+  one morning and will go stale. **Not** observed: CI. This repository has
+  never been pushed through the workflow, so write "CI runs `X`", never "CI is
+  green".

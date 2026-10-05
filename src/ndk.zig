@@ -31,17 +31,46 @@ const path = std.fs.path;
 /// `std.Io.Dir`, both of which pass through unchanged because they describe the
 /// machine, not the NDK.
 pub const Error = error{
-    /// No candidate path was set, and every candidate that was set is not on
-    /// disk. The caller can act by setting the `-Dndk` build option, or one of
-    /// `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK`.
+    /// No source named an NDK: none was set at all, or every source that was
+    /// set names a path that is not on disk. The caller can act by pointing the
+    /// `-Dndk` build option, or one of `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`,
+    /// `ANDROID_NDK`, at an unpacked installation, and
+    /// `Ndk.describeDiscoveryFailure` renders the four with what each read.
+    ///
+    /// An explicit `-Dndk` that is not on disk lands here too, and that is what
+    /// the option is for: `Ndk.find` treats it as a pin rather than as the first
+    /// of four preferences, so it cannot be answered by whatever
+    /// `ANDROID_NDK_HOME` the runner image happened to export. "The path I
+    /// named is not there" and "no shell set anything here" are different
+    /// mistakes, and the walk stops at both rather than reporting a success it
+    /// cannot vouch for.
     NdkNotFound,
-    /// A candidate path exists, but neither layout probed under it holds a
-    /// `toolchains/llvm/prebuilt/<host-tag>/sysroot`. The caller pointed at an
-    /// archive rather than an unpacked NDK, at an SDK root rather than an NDK,
-    /// or at an NDK unpacked for another host tag. `Ndk.Shape` names the two
-    /// layouts that are recognised; `Ndk.probeCandidates` names the two paths
-    /// that were probed under any root, and `Ndk.describeProbeFailure` renders
-    /// the refusal message CONTRACT.md D3 asks for.
+    /// A root does not hold a usable installation: neither layout probed under
+    /// it holds a `toolchains/llvm/prebuilt/<host-tag>/sysroot`. The caller
+    /// pointed at an archive rather than an unpacked NDK, at an SDK root rather
+    /// than an NDK, or at an NDK unpacked for another host tag. `Ndk.Shape`
+    /// names the two layouts that are recognised; `Ndk.probeCandidates` names
+    /// the two paths that were probed under any root, and
+    /// `Ndk.describeProbeFailure` renders the refusal message CONTRACT.md D3
+    /// asks for.
+    ///
+    /// Two paths reach this member without that meaning, and each says so where
+    /// it is produced, because a caller who renders this member's message has
+    /// to be able to tell them apart.
+    ///
+    /// `Ndk.open` puts a root that is missing altogether, or is a regular file,
+    /// here as well: `open` has no next source to walk past, so a root it
+    /// cannot use has nowhere else to go. Its own doc lists those cases, and
+    /// `describeProbeFailure` still answers them — a report for a path that is
+    /// not there is what tells the reader that it is not there.
+    ///
+    /// `Ndk.readVersion` puts a root that stopped being a directory here: the
+    /// installation resolved a moment earlier has been moved, removed, or
+    /// replaced by a file. Nothing about its layout is wrong, no probe was
+    /// refused, and `describeProbeFailure` is then misleading rather than
+    /// helpful — it names two sysroot paths for an installation that had
+    /// already resolved, and every path in that report is one nobody looked
+    /// for. The action is to resolve again, not to read a report.
     NotAnNdk,
     /// The host has no NDK host tag, so no NDK package ships a prebuilt
     /// toolchain for it. The caller can act only by building on one of the
@@ -314,7 +343,7 @@ pub const Ndk = struct {
     /// be typed for one root while D3's promise is about the *walk*, which is up
     /// to four roots — so it would need a second concept alongside the layouts
     /// for the roots that were skipped, and that is the half a caller needs most
-    /// when an inherited `ANDROID_NDK_HOME` outranked a local checkout. And an
+    /// when an inherited `ANDROID_NDK_HOME` outranked `ANDROID_NDK_ROOT`. And an
     /// out-parameter is written before the call and read after the error, so
     /// nothing at the signature says its value is meaningful on one branch only.
     ///
@@ -388,11 +417,26 @@ pub const Ndk = struct {
         root: []const u8,
         host: HostTag,
     ) (Allocator.Error || FsError)!Probes {
-        const root_abs = Dir.cwd().realPathFileAlloc(io, root, gpa) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => try gpa.dupe(u8, root),
+        // `resolve` trims a candidate the same way before it probes, so this
+        // reports the path that was probed rather than the one a shell spelled
+        // with a trailing newline on it.
+        const root_trimmed = trimCandidate(root);
+
+        // `realPathFileAlloc` returns `[:0]u8` and `free` recovers the block
+        // length through `mem.absorbSentinel`, so the value being freed has to
+        // keep the sentinel type. The fallback arm is `dupeZ` and not `dupe`
+        // for the same reason: with a plain `dupe` the peer type of the two
+        // arms is `[]u8` again, the free below asks for one byte fewer than the
+        // allocation, and an arena — which is what every caller in this
+        // repository passes — turns that mismatch into a silent no-op.
+        const canonical: [:0]u8 = Dir.cwd().realPathFileAlloc(io, root_trimmed, gpa) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => try gpa.dupeZ(u8, root_trimmed),
             else => |other| return other,
         };
-        defer gpa.free(root_abs);
+        defer gpa.free(canonical);
+        // Sentinel-typed for the free above, plain for the joins below: nothing
+        // here needs the sentinel and `path.join` takes `[]const u8`.
+        const root_abs: []const u8 = canonical;
 
         var probes: Probes = .{ .host_tag = host, .entries = undefined };
         var filled: usize = 0;
@@ -413,7 +457,7 @@ pub const Ndk = struct {
     /// asked for separately — and a caller who has to name those paths should
     /// not have to re-spell the two layouts to do it, because a second copy of
     /// that table is a second thing to get wrong. Use it where `NotAnNdk` is
-    /// caught:
+    /// caught from `find` or `open`:
     ///
     /// ```zig
     /// const install = Ndk.open(gpa, io, root, host) catch |err| {
@@ -423,6 +467,11 @@ pub const Ndk = struct {
     ///     return err;
     /// };
     /// ```
+    ///
+    /// Not from `readVersion`, which returns the same member for a root that
+    /// disappeared between the `open` and the read. No probe was refused
+    /// there, so every path in that report is one nobody looked for; resolve
+    /// again instead.
     ///
     /// A writer, not a `[]u8` the caller has to free: the caller already owns the
     /// sink it wants the message in — a `std.Build.Step.Fail` body, a log, an
@@ -435,6 +484,15 @@ pub const Ndk = struct {
     /// once, to canonicalise `root` if `root` is there at all, and then only
     /// composes strings, so it cannot itself become the failure the caller is
     /// reporting.
+    ///
+    /// The value is rendered escaped, and it is escaped because a candidate can
+    /// come from an environment variable: `export ANDROID_NDK_HOME=$(cat
+    /// ndk.path)` leaves a newline on the end of it, a CI YAML block scalar
+    /// leaves one, a `for` loop over a file leaves one, and POSIX allows one in
+    /// the middle of a directory name. Raw into this message that newline lands
+    /// mid-path and every line after it reads as part of the value, so a report
+    /// whose own content can move its own boundaries can lie about its
+    /// structure.
     pub fn describeProbeFailure(
         gpa: Allocator,
         io: Io,
@@ -445,19 +503,20 @@ pub const Ndk = struct {
         var probes = try probeCandidates(gpa, io, root, host);
         defer probes.deinit(gpa);
 
+        try writer.writeAll("no Android NDK sysroot under '");
+        try writeEscaped(writer, root);
         try writer.print(
-            \\no Android NDK sysroot under '{s}' for host tag '{s}'.
+            \\' for host tag '{s}'.
             \\
             \\discovery probes these paths, in this order, and takes the first one
             \\that is a directory:
             \\
-        , .{ root, probes.host_tag.directoryName() });
+        , .{probes.host_tag.directoryName()});
 
         for (probes.entries, 0..) |entry, i| {
-            try writer.print(
-                \\
-                \\  {d}. {s}: {s}
-            , .{ i + 1, @tagName(entry.shape), entry.sysroot });
+            try writer.print("  {d}. {s}: ", .{ i + 1, @tagName(entry.shape) });
+            try writeEscaped(writer, entry.sysroot);
+            try writer.writeAll("\n");
         }
 
         try writer.writeAll(
@@ -469,27 +528,159 @@ pub const Ndk = struct {
         );
     }
 
+    /// Writes a refusal naming every source `Ndk.find` walks, and the value it
+    /// read from each, into `writer`.
+    ///
+    /// The other half of D3's promise, and the commoner of the two refusals:
+    /// `describeProbeFailure` describes a root that was reached and turned out
+    /// to hold no sysroot, while this describes the walk that reached nothing —
+    /// the state before any `-Dndk` value exists, which is where a fresh
+    /// checkout and a CI runner both start. Use it where `NdkNotFound` is
+    /// caught:
+    ///
+    /// ```zig
+    /// const install = Ndk.find(gpa, io, explicit, &environ) catch |err| {
+    ///     if (err == error.NdkNotFound) {
+    ///         try Ndk.describeDiscoveryFailure(explicit, &environ, &log);
+    ///     }
+    ///     return err;
+    /// };
+    /// ```
+    ///
+    /// `environ` is the map `find` was handed, not the process environment read
+    /// a second time here: these are the walk's values, so a variable the runner
+    /// dropped between building the map and walking it is reported as this walk
+    /// saw it rather than as the shell spells it now.
+    ///
+    /// The four sources are the table `find` walks, so a refusal cannot name a
+    /// source the walk did not read or read one it did not name. A writer, not
+    /// a `[]u8` the caller has to free, for the reason `describeProbeFailure`
+    /// gives: the caller owns the sink it wants the message in, and the only
+    /// error this can add is `Writer.Error`.
+    ///
+    /// It allocates nothing and takes no allocator, so it owns nothing and has
+    /// no `deinit` — the same asymmetry as `Ndk`, for the same reason. Naming
+    /// four strings the caller already holds needs no paths built and no
+    /// filesystem walk, where `Ndk.Probes` exists precisely because probing a
+    /// root does.
+    ///
+    /// A build script cannot reach this, and that is a fact about `std.Build`
+    /// rather than about this package: a build script has no way to `@import`
+    /// the module it publishes, so a gate that refuses at configure time spells
+    /// these sources out itself. This is for the consumer that runs its own
+    /// discovery in Zig.
+    ///
+    /// Nothing here decides whether a source is an NDK, and nothing here claims
+    /// to: each is reported as the value `find` read from it, with `(unset)` or
+    /// `(empty)` where it has none. The one thing this checks is the host tag,
+    /// which is a switch over the compilation target and costs no filesystem
+    /// access — and which decides whether the four could have satisfied the
+    /// walk at all, since `find` refuses `UnsupportedHost` before it reads a
+    /// source. A report that listed four paths on such a build would be listing
+    /// paths nothing could have used.
+    pub fn describeDiscoveryFailure(
+        explicit: ?[]const u8,
+        environ: *const Environ.Map,
+        writer: *Writer,
+    ) Writer.Error!void {
+        try writer.writeAll(
+            \\
+            \\no Android NDK was found, so nothing here has a sysroot to point at.
+            \\
+            \\`Ndk.find` walks these sources in this order and takes the first one
+            \\holding an unpacked installation. A variable naming nothing on disk is
+            \\walked past rather than refused, which is what lets a stale
+            \\ANDROID_NDK_HOME hand the turn to the next source instead of failing the
+            \\walk. The `-Dndk` option is the one exception: it is a pin, so an
+            \\explicit path that is not there stops the walk here rather than being
+            \\answered by whatever the next variable exports. Each of them read:
+            \\
+        );
+
+        for (discovery_sources, 0..) |source, i| {
+            // The `-Dndk` option is the caller's and not the environment's, so
+            // the table names it rather than reading it from the map.
+            const value = if (source.env_var) |name| environ.get(name) else explicit;
+            try writer.print("  {d}. {s: <32} '", .{ i + 1, source.label });
+            try writeEscaped(writer, sourceOrUnset(value));
+            try writer.writeAll("'\n");
+        }
+
+        // `find` resolves the tag from the compilation target before it reads a
+        // single source, so on a host Google publishes no package for, none of
+        // the four above could have satisfied it. `hostTag` consults no
+        // directory, so this is a fact about the build and not a guess about
+        // the machine.
+        const host = hostTag(builtin.target) catch |err| switch (err) {
+            error.UnsupportedHost => {
+                try writer.writeAll(
+                    \\
+                    \\None of them can satisfy this build. Google publishes an NDK host
+                    \\tag for linux-x86_64, darwin-x86_64 and windows-x86_64 and for no
+                    \\others, so `Ndk.find` refuses `UnsupportedHost` here, meaning this
+                    \\build host has no NDK toolchain, before it reads a source at all.
+                    \\Build on one of those three hosts, or cross the NDK toolchain by
+                    \\hand; no value above changes that.
+                    \\
+                );
+                return;
+            },
+            // `hostTag` takes a target and consults no directory, so the
+            // NDK-domain refusals in its closed set cannot happen here. The arm
+            // says so rather than letting a bare `catch` drop them in silence.
+            else => unreachable,
+        };
+
+        try writer.print(
+            \\
+            \\Point one of them at an unpacked installation, the directory holding
+            \\`source.properties` and `toolchains/`, unpacked for host tag '{s}'.
+            \\
+        , .{host.directoryName()});
+    }
+
     /// Resolves an NDK by probing, in order: the explicit build option, then
     /// `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK`.
     ///
     /// `explicit` is the caller's `-Dndk` build option; pass `null` when it was
-    /// not set. `environ` is the build runner's environment map. The first
-    /// candidate that exists wins and later candidates are never read, so an
-    /// inherited `ANDROID_NDK_HOME` does silently outrank a local checkout;
-    /// `shape` on the result tells a caller which layout answered, which is
-    /// what to name when that inherited variable picked the wrong NDK. An
-    /// unset variable is skipped without complaint.
+    /// not set. `environ` is the build runner's environment map.
     ///
-    /// Returns `error.NdkNotFound` when no candidate was set or none of the set
-    /// ones is on disk, `error.NotAnNdk` when one exists but holds no sysroot,
-    /// and `error.UnsupportedHost` before any candidate is read when this
-    /// machine has no NDK host tag.
+    /// The explicit option is a PIN, not the first of four preferences. If it
+    /// names a path that is not on disk this returns `error.NdkNotFound`
+    /// instead of walking past it, because an option that can be answered by
+    /// whatever `ANDROID_NDK_HOME` a runner image happened to export is an
+    /// option nobody is told was ignored. CONTRACT.md D3 promises "explicit
+    /// beats implicit, always", and a fall-through made that promise false in
+    /// exactly the case it is about: a dangling symlink, a path typed from
+    /// memory, an NDK that was never fetched.
     ///
-    /// The four candidates in the documented order are the caller's to name,
+    /// Among the variables, first hit wins and the rest are never read, so an
+    /// inherited `ANDROID_NDK_HOME` does outrank `ANDROID_NDK_ROOT` and
+    /// `ANDROID_NDK`. `shape` on the result tells a caller which layout
+    /// answered, which is what to name when the inherited variable picked the
+    /// wrong NDK. An unset variable, or one holding nothing but whitespace, is
+    /// skipped without complaint.
+    ///
+    /// Surrounding whitespace is trimmed off every candidate before it is
+    /// probed, because a path with a newline on the end of it is a path that is
+    /// not there, and the shell accidents that produce one are ordinary:
+    /// `export ANDROID_NDK_HOME=$(cat ndk.path)`, a CI YAML block scalar, a
+    /// `for` loop over a file. The interior is left alone — POSIX lets a
+    /// directory name hold a newline, so trimming one out of the middle would
+    /// point the probe at a directory nobody named.
+    ///
+    /// Returns `error.NdkNotFound` when no source named an NDK,
+    /// `error.NotAnNdk` when one exists but holds no sysroot, and
+    /// `error.UnsupportedHost` before any candidate is read when this machine
+    /// has no NDK host tag.
+    ///
+    /// The four sources in the documented order are the caller's to name,
     /// because they come from a `-D` option and an environment map that are
-    /// both the caller's. `probeCandidates` names what was probed under any one
-    /// of them, so a refusal can carry both halves of D3's list: the sources
-    /// walked, in order, and the paths each was walked for.
+    /// both the caller's — and `describeDiscoveryFailure` names them from the
+    /// same table this walk reads, so nothing has to be re-spelled here.
+    /// `probeCandidates` names what was probed under any one of them, so a
+    /// refusal can carry both halves of D3's list: the sources walked, in
+    /// order, and the paths each was walked for.
     ///
     /// The host tag comes from the compilation target, `builtin.target`, which
     /// is the machine `zig build` runs on. Every slice the result stores comes
@@ -502,21 +693,34 @@ pub const Ndk = struct {
     ) (Error || Allocator.Error || FsError)!Ndk {
         const host = try hostTag(builtin.target);
 
-        const candidates = [4]?[]const u8{
-            explicit,
-            environ.get("ANDROID_NDK_HOME"),
-            environ.get("ANDROID_NDK_ROOT"),
-            environ.get("ANDROID_NDK"),
-        };
+        // One table of sources, walked here and rendered by
+        // `describeDiscoveryFailure`. A second spelling of these four is a
+        // second thing to get wrong, and it fails silently: a variable added to
+        // discovery and left out of what a refusal names leaves the reader
+        // hunting for a source the walk never read.
+        for (discovery_sources) |source| {
+            // The `-Dndk` option is the caller's and not the environment's, so
+            // the table names it rather than reading it from the map.
+            const value = if (source.env_var) |name| environ.get(name) else explicit;
+            // Trimmed here as well as in `resolve`, because the walk has to
+            // know a variable holding nothing but whitespace is not a candidate
+            // before it decides whether a missing path was a pin.
+            const candidate = trimCandidate(value orelse continue);
+            if (candidate.len == 0) continue;
 
-        for (candidates) |candidate| {
-            const candidate_path = candidate orelse continue;
-            if (resolve(gpa, io, candidate_path, host)) |resolved| {
+            if (resolve(gpa, io, candidate, host)) |resolved| {
                 return resolved;
             } else |err| switch (err) {
-                // Nothing at that path at all, so the next candidate gets its
-                // turn. Anything else is a decision the caller needs to see.
-                error.FileNotFound => {},
+                error.FileNotFound => {
+                    // An explicit path that is not on disk is the whole answer,
+                    // not a candidate to skip. Walking past it is what let
+                    // `-Dndk` be answered by whatever a runner image exported,
+                    // with nothing said about it.
+                    if (source.env_var == null) return error.NdkNotFound;
+                    // A variable that is not there hands the turn to the next
+                    // source.
+                },
+                // Anything else is a decision the caller needs to see.
                 else => |other| return other,
             }
         }
@@ -712,7 +916,17 @@ pub const Ndk = struct {
     /// `null` when the file is absent, which is legal: a repackaged NDK need
     /// not carry one, and an unknown version never blocks a build.
     /// `error.VersionUnreadable` when it is present but holds no parsable
-    /// `Pkg.Revision` line. Everything else is a filesystem error.
+    /// `Pkg.Revision` line.
+    ///
+    /// `error.NotAnNdk` is the one member of the set that arrives without a
+    /// judgement about the layout, and it is reached only when the root is
+    /// gone: this opens `root_path`, which `find` or `open` resolved and which
+    /// held a sysroot a moment earlier, and between those two calls the root
+    /// stopped being a directory — moved, removed, or replaced by a file.
+    /// `describeProbeFailure` is misleading rather than helpful here, naming
+    /// two sysroot paths for an installation that had already resolved;
+    /// resolve again instead. Every other failure is a filesystem error,
+    /// unchanged.
     ///
     /// This is the dotted code, `29.0.14206865`, which is what a build pins
     /// against. The sibling `Pkg.ReleaseName`, `r29`, is the string a human
@@ -846,6 +1060,80 @@ fn isDirectoryPath(io: Io, dir_path: []const u8) FsError!bool {
 /// of what a refusal reports.
 const probe_shapes = [_]Ndk.Shape{ .direct, .ndk_bundle };
 
+/// The sources `Ndk.find` walks, in walk order.
+///
+/// `env_var` is null for the `-Dndk` build option, which is the caller's and
+/// not the environment's. `label` is how a refusal names a source, because the
+/// option is not spelled like an environment variable and a report that printed
+/// four bare names would leave the reader to work out which of them is the one
+/// they typed.
+const discovery_sources = [_]struct { label: []const u8, env_var: ?[]const u8 }{
+    .{ .label = "the -Dndk build option", .env_var = null },
+    .{ .label = "the ANDROID_NDK_HOME environment", .env_var = "ANDROID_NDK_HOME" },
+    .{ .label = "the ANDROID_NDK_ROOT environment", .env_var = "ANDROID_NDK_ROOT" },
+    .{ .label = "the ANDROID_NDK environment", .env_var = "ANDROID_NDK" },
+};
+
+/// A candidate as discovery reads it: surrounding whitespace removed, the
+/// interior untouched.
+///
+/// A path with a newline on the end of it is a path that is not there, and the
+/// shell accidents that produce one are ordinary rather than exotic: `export
+/// ANDROID_NDK_HOME=$(cat ndk.path)`, a CI YAML block scalar, a `for` loop over
+/// a file, a Windows `.bat`. The interior is left alone because POSIX lets a
+/// directory name hold a newline, so trimming one out of the middle would point
+/// the probe at a directory nobody named — and what is left is escaped in the
+/// refusal, so a real one still reads as one line.
+///
+/// Borrowed from the input, so the caller frees nothing.
+fn trimCandidate(value: []const u8) []const u8 {
+    return std.mem.trim(u8, value, " \t\r\n");
+}
+
+/// One discovery source's value, the way a refusal reads it.
+///
+/// `(unset)` for a source that carries nothing, `(empty)` for one that carries
+/// whitespace only, and the trimmed value itself otherwise — trimmed, because a
+/// report that printed a padded path would name a path discovery never probed.
+/// The two markers are kept apart because they are different facts: `(unset)`
+/// says no shell exported anything under that name, `(empty)` says one did and
+/// exported nothing under it, and the second is a shell bug worth naming rather
+/// than a variable that is missing.
+///
+/// Borrowed from the input or from a literal; the caller frees nothing.
+fn sourceOrUnset(value: ?[]const u8) []const u8 {
+    const trimmed = trimCandidate(value orelse return "(unset)");
+    if (trimmed.len == 0) return "(empty)";
+    return trimmed;
+}
+
+/// Writes `text` with the bytes that could move a report off its own line
+/// escaped, so a value that arrived from an environment cannot reformat the
+/// message quoting it.
+///
+/// A newline is the case that matters. Rendered raw it lands mid-path in the
+/// middle of the message and every line after it reads as part of the value, so
+/// a report whose own content can move its own boundaries can lie about its
+/// structure. Bytes above ASCII are written as the filesystem spelled them:
+/// this decodes nothing, and a report that dropped what it could not name would
+/// be reporting a value nobody set.
+fn writeEscaped(writer: *Writer, text: []const u8) Writer.Error!void {
+    for (text) |c| {
+        switch (c) {
+            // The byte that quotes a value and the byte that continues a quoted
+            // one. Both stay readable; the backslash in front says which.
+            '\\', '\'' => {
+                try writer.writeByte('\\');
+                try writer.writeByte(c);
+            },
+            // Every C0 control and DEL. None of them belongs in a path a reader
+            // wants, and every one of them can end a line or move the cursor.
+            0x00...0x1f, 0x7f => try writer.print("\\x{x:0>2}", .{c}),
+            else => try writer.writeByte(c),
+        }
+    }
+}
+
 /// The NDK root and the sysroot one layout implies under an absolute `root`.
 /// Gpa-owned; free both slices through `Probes.Entry.deinit`.
 ///
@@ -895,14 +1183,23 @@ fn resolve(
     root: []const u8,
     host: HostTag,
 ) (Error || Allocator.Error || FsError)!Ndk {
-    const canonical = Dir.cwd().realPathFileAlloc(io, root, gpa) catch |err| switch (err) {
+    // Trimmed here as well as in `Ndk.probeCandidates`, because those two have
+    // to canonicalise the same string: one probes it and the other reports it,
+    // and a report naming a path the probe never looked at is the one thing
+    // both exist to prevent.
+    const root_trimmed = trimCandidate(root);
+
+    const canonical = Dir.cwd().realPathFileAlloc(io, root_trimmed, gpa) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         error.NotDir => return error.NotAnNdk,
         else => |other| return other,
     };
     defer gpa.free(canonical);
-    // realPathFileAlloc hands back a sentinel slice; nothing here needs the
-    // sentinel and every path.join below wants a plain slice.
+    // The sentinel stays on `canonical` because that is the value being freed:
+    // `free` recovers the block length through `mem.absorbSentinel`, so a
+    // `[]u8` alias of a `[:0]u8` asks for one byte fewer than `dupeZ` allocated.
+    // `Ndk.probeCandidates` holds the same rule for the same reason. The peel
+    // below is only for the joins, which take a plain slice.
     const root_abs: []const u8 = canonical;
 
     for (probe_shapes) |shape| {
@@ -1470,10 +1767,11 @@ test "find takes the build option first, then the variables in order" {
         const ndk = try Ndk.find(gpa, testing.io, null, &environ);
         try testing.expectEqualStrings(env_root, ndk.root_path);
     }
-    // A candidate that is not on disk is skipped for the next one.
+    // A variable that is not on disk is skipped for the next one. An explicit
+    // option is not, which is what the test below says.
     {
         try environ.put("ANDROID_NDK_HOME", missing);
-        const ndk = try Ndk.find(gpa, testing.io, missing, &environ);
+        const ndk = try Ndk.find(gpa, testing.io, null, &environ);
         try testing.expectEqualStrings(env_root, ndk.root_path);
     }
     // An existing directory that is not an NDK stops discovery, so the mistake
@@ -1803,5 +2101,340 @@ test "an ABI round-trips through its on-disk directory name" {
             if (j <= i) continue;
             try testing.expect(Abi.fromDirectoryName(a.directoryName()) != b);
         }
+    }
+}
+
+/// How many non-overlapping occurrences of `needle` are in `haystack`.
+/// Test helper.
+fn countOf(haystack: []const u8, needle: []const u8) usize {
+    var found: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, at, needle)) |start| {
+        found += 1;
+        at = start + needle.len;
+    }
+    return found;
+}
+
+test "the probe paths are freed under a checking allocator" {
+    // The defect this catches: `probeCandidates` bound the peeled type of
+    // `realPathFileAlloc` — which returns `[:0]u8` — to the value it frees, so
+    // `Allocator.free` recovered the block length without the sentinel and asked
+    // for one byte fewer than `dupeZ` allocated, on every call whose root is on
+    // disk. Nothing else in this repository could see it: every caller here and
+    // in `build.zig` hands these two functions an arena, and an arena makes a
+    // short free a silent no-op. `testing.allocator` compares the free size
+    // against the allocation, so it is the only allocator that turns this back
+    // into a failure, and passing one is the whole point of the test.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    // On disk, because that is the branch `realPathFileAlloc` answers. The
+    // absent-root branch allocates through `dupeZ` and was never short.
+    _ = try createAll(gpa, &.{
+        root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+    });
+
+    {
+        var probes = try Ndk.probeCandidates(testing.allocator, testing.io, root, .linux_x86_64);
+        defer probes.deinit(testing.allocator);
+        try testing.expectEqual(HostTag.linux_x86_64, probes.host_tag);
+        try testing.expectEqual(@as(usize, 2), probes.entries.len);
+        try testing.expect(probes.entries[0].sysroot.len > 0);
+    }
+
+    // And through the renderer a consumer reaches, which owns the same free.
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try Ndk.describeProbeFailure(testing.allocator, testing.io, root, .linux_x86_64, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "linux-x86_64") != null);
+}
+
+test "a discovery refusal names every source and the value it read" {
+    // The defect this catches: the renderer for `NdkNotFound` — the refusal a
+    // caller meets first, and the only one this package exported nothing for —
+    // was a private function in `build.zig`, so `@import` carried the renderer
+    // for the rarer `NotAnNdk` and not this one. Every consumer had to re-spell
+    // the walk, and the vocabulary that tells a variable no shell exported from
+    // one that was exported empty.
+    //
+    // Synthetic maps, never the process environment: a test that read the real
+    // one would assert whatever the machine running it happened to export.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    // Nothing set anywhere, which is what a fresh checkout looks like.
+    {
+        var environ: Environ.Map = .init(testing.allocator);
+        defer environ.deinit();
+
+        var out: Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try Ndk.describeDiscoveryFailure(null, &environ, &out.writer);
+        const message = out.written();
+
+        // All four, in the walk's order. The labels, not the bare names: the
+        // paragraph above the list names `ANDROID_NDK_HOME` in prose, and the
+        // order being asserted is the order of the sources, not the order of
+        // first mention.
+        const option_at = std.mem.indexOf(u8, message, "the -Dndk build option").?;
+        const home_at = std.mem.indexOf(u8, message, "the ANDROID_NDK_HOME environment").?;
+        const root_at = std.mem.indexOf(u8, message, "the ANDROID_NDK_ROOT environment").?;
+        const bare_at = std.mem.indexOf(u8, message, "the ANDROID_NDK environment").?;
+        try testing.expect(option_at < home_at);
+        try testing.expect(home_at < root_at);
+        try testing.expect(root_at < bare_at);
+
+        // One `(unset)` per source, four sources, and nothing else quoted: the
+        // report cannot be naming a variable the map does not have.
+        try testing.expectEqual(@as(usize, 4), discovery_sources.len);
+        try testing.expectEqual(discovery_sources.len, countOf(message, "(unset)"));
+        try testing.expect(std.mem.indexOf(u8, message, "(empty)") == null);
+
+        // Which is the refusal this message is for.
+        try testing.expectError(
+            error.NdkNotFound,
+            Ndk.find(gpa, testing.io, null, &environ),
+        );
+    }
+
+    // Set, empty and set again: three renderings, and the two values are the
+    // caller's own strings rather than copies of them.
+    {
+        var environ: Environ.Map = .init(testing.allocator);
+        defer environ.deinit();
+        try environ.put("ANDROID_NDK_HOME", "/opt/ndk/r29");
+        try environ.put("ANDROID_NDK_ROOT", "");
+        try environ.put("ANDROID_NDK", "~/ndk");
+
+        var out: Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try Ndk.describeDiscoveryFailure("/opt/ndk/explicit", &environ, &out.writer);
+        const message = out.written();
+
+        try testing.expect(std.mem.indexOf(u8, message, "/opt/ndk/explicit") != null);
+        try testing.expect(std.mem.indexOf(u8, message, "/opt/ndk/r29") != null);
+        try testing.expect(std.mem.indexOf(u8, message, "~/ndk") != null);
+        // The empty one reads `(empty)` and not `(unset)`: a reader shown
+        // `(unset)` would go looking for a variable that was exported.
+        try testing.expect(std.mem.indexOf(u8, message, "'(empty)'") != null);
+        try testing.expectEqual(@as(usize, 0), countOf(message, "(unset)"));
+    }
+}
+
+test "an explicit -Dndk that is not on disk is a pin, not a preference" {
+    // The defect this catches: the walk fell through on `FileNotFound`, so
+    // `-Dndk=/opt/android-ndk-r29` naming a path that is not there — a dangling
+    // symlink, a typo, an NDK that was never fetched — was answered by whatever
+    // `ANDROID_NDK_HOME` the runner image happened to export. The build linked,
+    // reported success, and never said the option had been ignored, which is
+    // the case CONTRACT.md D3's "explicit beats implicit, always" is about.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    // `find` takes the host tag from the compilation target, so on a host Google
+    // publishes no package for there is no tree worth building. That is not a
+    // silent skip: the refusal is asserted in its place by the discovery test
+    // above, and those hosts are exactly what it exercises.
+    const host = Ndk.hostTag(builtin.target) catch |err| switch (err) {
+        error.UnsupportedHost => return,
+        else => unreachable,
+    };
+
+    var good_scratch = testing.tmpDir(.{});
+    defer good_scratch.cleanup();
+    const good = try createNdk(gpa, &good_scratch, host, "riscv64-linux-android", &.{});
+
+    var dead_scratch = testing.tmpDir(.{});
+    defer dead_scratch.cleanup();
+    const dead_root = try absPathOf(gpa, &dead_scratch);
+    const missing = try path.join(gpa, &.{ dead_root, "not-installed" });
+
+    var environ: Environ.Map = .init(testing.allocator);
+    defer environ.deinit();
+    try environ.put("ANDROID_NDK_HOME", good);
+    try environ.put("ANDROID_NDK_ROOT", good);
+    try environ.put("ANDROID_NDK", good);
+
+    // Present: the option answers, as it always did.
+    {
+        const ndk = try Ndk.find(gpa, testing.io, good, &environ);
+        try testing.expectEqualStrings(good, ndk.root_path);
+    }
+    // Absent: the walk stops, even though all three variables name an
+    // installation that is right there.
+    try testing.expectError(
+        error.NdkNotFound,
+        Ndk.find(gpa, testing.io, missing, &environ),
+    );
+    // Not named at all, so the variables answer as they always did.
+    {
+        const ndk = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(good, ndk.root_path);
+    }
+    // Named with nothing in it is not naming a path, and pins nothing.
+    {
+        const empty = try Ndk.find(gpa, testing.io, "", &environ);
+        try testing.expectEqualStrings(good, empty.root_path);
+        const blank = try Ndk.find(gpa, testing.io, "  \t\r\n ", &environ);
+        try testing.expectEqualStrings(good, blank.root_path);
+    }
+    // A root that is there and holds no NDK already stopped the walk and still
+    // does: the pin is about absence, not about a path that answers wrongly.
+    {
+        var meta_scratch = testing.tmpDir(.{});
+        defer meta_scratch.cleanup();
+        const meta_root = try absPathOf(gpa, &meta_scratch);
+        _ = try createAll(gpa, &.{ meta_root, "meta" });
+        try testing.expectError(
+            error.NotAnNdk,
+            Ndk.find(gpa, testing.io, meta_root, &environ),
+        );
+    }
+}
+
+test "a candidate with whitespace around it is the path without the whitespace" {
+    // The defect this catches: nothing trimmed a candidate before probing it,
+    // so `export ANDROID_NDK_HOME=$(cat ndk.path)` — and every CI YAML block
+    // scalar, `for` loop over a file and Windows `.bat` that leaves the same
+    // newline on a value — named a path that was never there. The walk then
+    // refused with `NdkNotFound`, which says nothing about a newline, or linked
+    // the next variable's NDK without a word.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    const host = Ndk.hostTag(builtin.target) catch |err| switch (err) {
+        error.UnsupportedHost => return,
+        else => unreachable,
+    };
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const good = try createNdk(gpa, &scratch, host, "x86_64-linux-android", &.{});
+
+    const paddings = [_][]const u8{
+        "\n", // $(cat file), or a YAML `|`
+        "\r\n", // the same value through a CRLF checkout
+        "\r", // an old shell, or a CR left by a Windows editor
+        " ", // a quoted expansion with a stray space
+        "\t", // a tab-indented value in a Makefile
+        " \t\r\n ", // all of them at once
+    };
+    for (paddings) |padding| {
+        var environ: Environ.Map = .init(testing.allocator);
+        defer environ.deinit();
+        const padded = try std.fmt.allocPrint(gpa, "{s}{s}", .{ good, padding });
+        try environ.put("ANDROID_NDK_HOME", padded);
+
+        const ndk = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(good, ndk.root_path);
+    }
+
+    // A value that is nothing but whitespace is not a candidate at all, and pins
+    // nothing: there is no path in it to be wrong about.
+    {
+        var environ: Environ.Map = .init(testing.allocator);
+        defer environ.deinit();
+        try environ.put("ANDROID_NDK_HOME", " \t\r\n ");
+        try environ.put("ANDROID_NDK_ROOT", good);
+        const ndk = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(good, ndk.root_path);
+    }
+
+    // The interior is not trimmed, because POSIX lets a directory name hold a
+    // newline and trimming one out would refuse a path that really is there. It
+    // resolves when that directory exists...
+    {
+        const nested = try path.join(gpa, &.{ good, "two\nlines" });
+        _ = try createAll(gpa, &.{
+            nested,
+            "toolchains",
+            "llvm",
+            "prebuilt",
+            host.directoryName(),
+            "sysroot",
+        });
+        var environ: Environ.Map = .init(testing.allocator);
+        defer environ.deinit();
+        try environ.put("ANDROID_NDK_HOME", nested);
+        const ndk = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(nested, ndk.root_path);
+    }
+    // ...and is walked past, like any other path that is not there.
+    {
+        var environ: Environ.Map = .init(testing.allocator);
+        defer environ.deinit();
+        try environ.put("ANDROID_NDK_HOME", try path.join(gpa, &.{ good, "not\nhere" }));
+        try environ.put("ANDROID_NDK_ROOT", good);
+        const ndk = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(good, ndk.root_path);
+    }
+}
+
+test "a refusal stays one line whatever the candidate carries" {
+    // The defect this catches: the value was rendered raw, so a candidate that
+    // arrived with a newline on the end of it — or, which POSIX allows, in the
+    // middle — broke the report across lines and every line after the break read
+    // as part of the path. A message whose own content can move its own
+    // boundaries can lie about its structure.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    // A root with nothing to escape, and one whose name holds a newline and a
+    // tab.
+    const clean = try probeMessage(root, .linux_x86_64);
+    defer testing.allocator.free(clean);
+
+    const noisy = try probeMessage(
+        try path.join(gpa, &.{ root, "android\nndk\tr29" }),
+        .linux_x86_64,
+    );
+    defer testing.allocator.free(noisy);
+
+    // The same number of lines as the root with nothing to escape: the newline
+    // and the tab became escapes rather than line breaks.
+    try testing.expectEqual(countOf(clean, "\n"), countOf(noisy, "\n"));
+    // Visible rather than swallowed, so a reader can see that the value they
+    // exported is not the value that was probed.
+    try testing.expect(std.mem.indexOf(u8, noisy, "android\\x0andk\\x09r29") != null);
+    try testing.expect(std.mem.indexOf(u8, clean, "\\x0a") == null);
+
+    // The discovery refusal has the same hazard in it: a variable carries a
+    // newline as easily as a path does.
+    {
+        var noisy_env: Environ.Map = .init(testing.allocator);
+        defer noisy_env.deinit();
+        try noisy_env.put("ANDROID_NDK_HOME", "/opt/ndk\nr29");
+
+        var bare_env: Environ.Map = .init(testing.allocator);
+        defer bare_env.deinit();
+        try bare_env.put("ANDROID_NDK_HOME", "/opt/ndk-r29");
+
+        var noisy_out: Writer.Allocating = .init(testing.allocator);
+        defer noisy_out.deinit();
+        try Ndk.describeDiscoveryFailure(null, &noisy_env, &noisy_out.writer);
+
+        var bare_out: Writer.Allocating = .init(testing.allocator);
+        defer bare_out.deinit();
+        try Ndk.describeDiscoveryFailure(null, &bare_env, &bare_out.writer);
+
+        try testing.expectEqual(
+            countOf(bare_out.written(), "\n"),
+            countOf(noisy_out.written(), "\n"),
+        );
+        try testing.expect(std.mem.indexOf(u8, noisy_out.written(), "/opt/ndk\\x0ar29") != null);
     }
 }

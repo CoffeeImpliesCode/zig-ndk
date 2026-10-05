@@ -5,8 +5,12 @@
     // checksum: u32 }` (src/Package.zig:9-30) and `validate` requires
     // `checksum == std.hash.Crc32.hash(name)`. `name` is the `.name` enum
     // literal token (src/Package/Manifest.zig:387-404), i.e. "zig_ndk".
-    // crc32("zig_ndk") == 0xdb4b4a79, which is the high half below; the low
-    // half is the random `id` from `Fingerprint.generate`.
+    // crc32("zig_ndk") == 0xdb4b4a79, which is the high half below and is
+    // what `validate` checks. The low half is the `id`, which the manifest
+    // accepts verbatim: `validate` does not constrain it. An audit found no
+    // occurrence of this value anywhere in the Zig 0.16.0 tree, so its origin
+    // is not recorded by an artefact in this repository; treat it as an opaque
+    // identifier rather than as a value with a verifiable derivation.
     .fingerprint = 0xdb4b4a79be9224ab,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
@@ -14,6 +18,7 @@
         "build.zig",
         "build.zig.zon",
         "root.zig",
+        "NOTICE.md",
         "src",
         "test",
         "README.md",

@@ -31,7 +31,7 @@
 # because the guard has to run before the first of them:
 #
 #   bash dirname mktemp rm cp mv cat tr cut sort uname jq sed awk diff
-#   sha256sum sha1sum wc unzip
+#   sha256sum sha1sum wc unzip grep
 #
 # None of it is a GNU-only construct. The one rewrite sed could have owned goes
 # through a temp file and a rename instead of `sed -i`, and the rest is POSIX
@@ -84,7 +84,7 @@ EOF
 # "dirname: command not found" and exit 127, several lines above the one check
 # whose entire job is to name the tool that is missing.
 for tool in bash dirname mktemp rm cp mv cat tr cut sort uname jq sed awk \
-    diff sha256sum sha1sum wc unzip; do
+    diff sha256sum sha1sum wc unzip grep; do
     command -v "$tool" >/dev/null 2>&1 ||
         die "$tool is required; this script cannot run without it"
 done
@@ -110,27 +110,43 @@ cleanup() {
 trap cleanup EXIT
 
 NDK_ROOT=""
-NDK_ZIP=""
+# $NDK_ZIP is read from the environment, which is what this script's usage text
+# has always said it defaults to. An unconditional empty assignment made that a
+# route the script did not offer: an exported NDK_ZIP was discarded here,
+# before the search below could use it, and the usage text kept promising it.
+# --zip still wins -- the argument loop assigns over this value.
+NDK_ZIP=${NDK_ZIP:-}
 ACCEPT=0
+
+# One flag per path argument. `--ndk=` with nothing after it is a different
+# request from "no --ndk at all", and the `[ -z "$NDK_ROOT" ]` tests below read
+# them as the same one: an operator naming an empty path got a run that quietly
+# verified a DIFFERENT NDK from the environment, and it exited 0.
+NDK_ROOT_SET=0
+NDK_ZIP_SET=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --ndk)
             [ $# -ge 2 ] || die "--ndk needs a path"
             NDK_ROOT=$2
+            NDK_ROOT_SET=1
             shift 2
             ;;
         --ndk=*)
             NDK_ROOT=${1#--ndk=}
+            NDK_ROOT_SET=1
             shift
             ;;
         --zip)
             [ $# -ge 2 ] || die "--zip needs a path"
             NDK_ZIP=$2
+            NDK_ZIP_SET=1
             shift 2
             ;;
         --zip=*)
             NDK_ZIP=${1#--zip=}
+            NDK_ZIP_SET=1
             shift
             ;;
         --accept)
@@ -147,6 +163,15 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# Both spellings of both flags, so an empty operand is a refusal rather than a
+# silent fall-through to the discovery order or to the /nix/store glob.
+if [ "$NDK_ROOT_SET" -eq 1 ] && [ -z "$NDK_ROOT" ]; then
+    die "--ndk was given with an empty value. Name the NDK root, or drop the flag and let the discovery order choose."
+fi
+if [ "$NDK_ZIP_SET" -eq 1 ] && [ -z "$NDK_ZIP" ]; then
+    die "--zip was given with an empty value. Name the archive, or drop the flag and let the search below choose."
+fi
 
 [ -f "$RECORD" ] || die "missing $RECORD"
 [ -f "$TABLE" ] || die "missing $TABLE; the ABI table this script diffs is not here"
@@ -280,6 +305,8 @@ if [ -z "$NDK_ROOT" ]; then
             TRIED+=("$candidate")
             FOUND=$candidate
             break
+        elif [ -L "$candidate" ] && [ ! -e "$candidate" ]; then
+            TRIED+=("$candidate   (a symlink that does not resolve)")
         else
             TRIED+=("$candidate   (not a directory)")
         fi
@@ -293,7 +320,8 @@ if [ -z "$NDK_ROOT" ]; then
                 1) varname=ANDROID_NDK_ROOT ;;
                 *) varname=ANDROID_NDK ;;
             esac
-            printf '  %s. %-20s %s\n' "$((index + 2))" "$varname" "${TRIED[$index]}" >&2
+            printf '  %s. %-20s %s\n' "$((index + 2))" "$varname" \
+                "$(printf '%s' "${TRIED[$index]}" | tr '\n' '|')" >&2
         done
         exit 1
     fi
@@ -342,6 +370,22 @@ else
     exit 1
 fi
 
+# A directory called sysroot is not a sysroot. The probe above asks whether the
+# path exists, so a stub holding two copied metadata files -- source.properties
+# and meta/abis.json, both taken from a real NDK, and nothing else -- was
+# accepted here and then had its ABI table diffed as if it were the NDK. A real
+# sysroot carries what every path this package builds is built from: usr/include
+# for the headers, usr/lib/<triple> for the libc.
+SYSROOT="$NDK_ROOT/$SYSROOT_REL"
+if [ ! -d "$SYSROOT/usr/include" ] && [ ! -d "$SYSROOT/usr/lib" ]; then
+    printf 'sync-ndk: %s is not a sysroot.\n' "$SYSROOT" >&2
+    printf '  It holds neither usr/include nor usr/lib, so it is a directory at\n' >&2
+    printf '  the right path and nothing else -- which is exactly the shape a\n' >&2
+    printf '  two-file stub copied out of a real NDK has, and the shape this\n' >&2
+    printf '  script cannot tell from an NDK by reading metadata alone.\n' >&2
+    exit 1
+fi
+
 # This is also the "is the host tag this machine resolves to actually in this
 # NDK" check, which is the check that catches an NDK unpacked for another host:
 # there is no sysroot for this machine to have found.
@@ -365,10 +409,12 @@ for entry in "$PREBUILT"/*; do
 done
 LC_ALL=C sort -o "$WORK/shipped-tags.tsv" "$WORK/shipped-tags.tsv"
 
-SHIPPED_COUNT=$(wc -l <"$WORK/shipped-tags.tsv" | tr -d ' ')
-if [ "$SHIPPED_COUNT" -eq 0 ]; then
-    die "$PREBUILT holds no host package directory, so this NDK serves no host at all"
-fi
+# No "and it holds no host package at all" branch here, because there is no
+# state that reaches it: the sysroot probe above has already required
+# toolchains/llvm/prebuilt/$HOST_DIR to exist, and none of the three directory
+# names HostTag maps its tags to begins with a dot, so the glob always matches
+# at least the machine's own host. The old zero test could only fire in a state
+# the probe had already refused, so it read as a check and was not one.
 
 # One direction: the NDK ships a host this package does not declare. Nothing
 # scraped out of src/ndk.zig can see that, and it is the drift that leaves
@@ -426,9 +472,15 @@ fi
 # is only a self-report, so a missing archive is a failure and never a skipped
 # check.
 if [ -z "$NDK_ZIP" ]; then
+    # The glob is spelled as a quoted prefix, an unquoted star, and a quoted
+    # pattern. `${PIN_RELEASE}` comes straight out of tools/ndk.sha256 and used
+    # to be pasted into the pattern unquoted, where a space in the value
+    # word-splits it; and a pattern that matches nothing is precisely the
+    # "this check quietly checks nothing" failure the rest of this script
+    # refuses to allow.
     for candidate in \
         "$NDK_SEARCH_ROOT/../android-ndk-${PIN_RELEASE}-linux.zip" \
-        /nix/store/*android-ndk-${PIN_RELEASE}-linux.zip; do
+        "/nix/store/"*"android-ndk-${PIN_RELEASE}-linux.zip"; do
         if [ -f "$candidate" ]; then
             NDK_ZIP=$candidate
             break
@@ -438,10 +490,37 @@ fi
 
 if [ -z "$NDK_ZIP" ] || [ ! -f "$NDK_ZIP" ]; then
     printf 'sync-ndk: release identity NOT verified: no NDK archive found.\n' >&2
-    printf '  Tried, in this order:\n' >&2
-    printf '    1. --zip <path>\n' >&2
-    printf '    2. %s\n' "$NDK_SEARCH_ROOT/../android-ndk-${PIN_RELEASE}-linux.zip" >&2
-    printf '    3. /nix/store/*android-ndk-%s-linux.zip\n' "$PIN_RELEASE" >&2
+    # An explicit --zip that names a directory is an error about THAT path, not
+    # a search that came up empty. Listing the three defaults it never looked
+    # at sent the reader looking for a download instead of reading the path they
+    # typed.
+    if [ "$NDK_ZIP_SET" -eq 1 ]; then
+        if [ -d "$NDK_ZIP" ]; then
+            printf '  --zip names a directory, not an archive: %s\n' "$NDK_ZIP" >&2
+        else
+            printf '  --zip names no readable file: %s\n' "$NDK_ZIP" >&2
+        fi
+    else
+        printf '  Tried, in this order:\n' >&2
+        printf '    1. --zip <path>\n' >&2
+        printf '    2. %s\n' "$NDK_SEARCH_ROOT/../android-ndk-${PIN_RELEASE}-linux.zip" >&2
+        printf '    3. /nix/store/*android-ndk-%s-linux.zip\n' "$PIN_RELEASE" >&2
+    fi
+    # The name the SEARCH builds is the pinned release's, so a tree from a
+    # different release cannot have one under that name -- and that is the bump
+    # this gate exists to police, not a missing download. Say which of the two
+    # it is, because "no archive found" on its own sends the person doing the
+    # bump looking for a download that was never wrong. (With --zip given, the
+    # question was never a search, and the line above already answered it.)
+    if [ "$GOT_RELEASE" != "$PIN_RELEASE" ]; then
+        printf '  The tree at the NDK root reports %s (%s) and the pin records\n' "$GOT_RELEASE" "$GOT_REVISION" >&2
+        printf '  %s (%s): the archive is named after the pinned release, so a\n' "$PIN_RELEASE" "$PIN_REVISION" >&2
+        printf '  bumped tree has none under that name. Move the URL in\n' >&2
+        printf '  .github/workflows/ci.yml and re-record this pin for it.\n' >&2
+    else
+        printf '  The tree at the NDK root reports %s (%s), the release this pin\n' "$GOT_RELEASE" "$GOT_REVISION" >&2
+        printf '  records, so the archive is genuinely not beside it.\n' >&2
+    fi
     printf '  An unpacked tree can assert its own revision; only the published\n' >&2
     printf '  archive proves which release that revision came from. Re-run with\n' >&2
     printf '  --zip <path-to-android-ndk-%s-linux.zip>.\n' "$PIN_RELEASE" >&2
@@ -451,8 +530,13 @@ fi
 printf 'zip:       %s\n' "$NDK_ZIP"
 
 GOT_SIZE=$(wc -c <"$NDK_ZIP" | tr -d ' ')
-GOT_SHA=$(sha256sum "$NDK_ZIP" | cut -d' ' -f1)
-GOT_SHA1=$(sha1sum "$NDK_ZIP" | cut -d' ' -f1)
+# `<file`, not `<$file`: coreutils prefixes the digest with a backslash when the
+# name it prints needs escaping -- a newline or a backslash in the path -- so the
+# argv form yields `\4abbbcdc...` and a bit-identical archive reads as CHANGED on
+# both digests. With stdin there is no name to escape and the output is
+# `<digest>  -`, which is what `cut -d' ' -f1` expects.
+GOT_SHA=$(sha256sum <"$NDK_ZIP" | cut -d' ' -f1)
+GOT_SHA1=$(sha1sum <"$NDK_ZIP" | cut -d' ' -f1)
 
 if [ "$GOT_SHA" = "$PIN_SHA" ]; then
     printf 'sha256:    matches the pin (computed here; Google publishes no SHA-256)\n'
@@ -546,6 +630,53 @@ else
     exit 1
 fi
 
+# The same tie, for the file every diff below is computed from. The archive's
+# own meta/abis.json sits inside the very zip whose digest was just verified and
+# was never read: source.properties is a self-report, and comparing two
+# self-reports binds the tree's NAME to the archive, not the tree's CONTENTS.
+# So a tree whose abis.json was edited -- llvm_triple retargeted, bitness
+# rewritten, an ABI deleted -- still agreed with the archive on everything the
+# old tie looked at, and the diff below then reported it as NDK drift against
+# metadata the digests cover. Both sides are canonicalised with `jq -S .` so the
+# comparison is of the JSON, not of its formatting or key order.
+ARCHIVE_ABIS_RAW="$WORK/archive-abis.json.raw"
+if ! unzip -p "$NDK_ZIP" '*/meta/abis.json' >"$ARCHIVE_ABIS_RAW" 2>"$WORK/unzip-abis.err"; then
+    printf 'sync-ndk: the archive carries no meta/abis.json, so the table this\n' >&2
+    printf 'script is about to diff cannot be tied to the bytes its digests\n' >&2
+    printf 'cover. Archive: %s\n' "$NDK_ZIP" >&2
+    cat "$WORK/unzip-abis.err" >&2
+    exit 1
+fi
+ARCHIVE_ABIS="$WORK/archive-abis.json"
+if ! jq -S . "$ARCHIVE_ABIS_RAW" >"$ARCHIVE_ABIS" 2>"$WORK/jq-archive.err"; then
+    printf 'sync-ndk: the archive carries a meta/abis.json jq cannot parse.\n' >&2
+    printf '  archive: %s\n' "$NDK_ZIP" >&2
+    sed 's/^/  /' "$WORK/jq-archive.err" >&2
+    exit 1
+fi
+ARCHIVE_ABIS_COPIES=$(jq -s 'length' "$ARCHIVE_ABIS_RAW")
+if [ "$ARCHIVE_ABIS_COPIES" -ne 1 ]; then
+    die "$NDK_ZIP holds $ARCHIVE_ABIS_COPIES copies of meta/abis.json; there is no single table to tie the tree to"
+fi
+TREE_ABIS="$WORK/tree-abis.json"
+if ! jq -S . "$NDK_ROOT/meta/abis.json" >"$TREE_ABIS" 2>"$WORK/jq-tree.err"; then
+    printf 'sync-ndk: %s is not JSON this script can parse.\n' "$NDK_ROOT/meta/abis.json" >&2
+    sed 's/^/  /' "$WORK/jq-tree.err" >&2
+    exit 1
+fi
+if diff -q "$TREE_ABIS" "$ARCHIVE_ABIS" >/dev/null 2>&1; then
+    printf 'abi tie:   tree and archive carry the same meta/abis.json\n'
+else
+    printf 'tree/archive ABI TIE BROKEN: this tree did not come out of this archive.\n' >&2
+    printf '  tree:    %s\n' "$NDK_ROOT/meta/abis.json" >&2
+    printf '  archive: %s\n' "$NDK_ZIP" >&2
+    printf '  archive is on the left, tree on the right. This is not NDK drift:\n' >&2
+    printf '  the digests above cover the archive, and the table this script\n' >&2
+    printf '  diffs src/ndk.zig against is the archive'"'"'s, not the tree'"'"'s.\n' >&2
+    diff -u "$ARCHIVE_ABIS" "$TREE_ABIS" >&2 || true
+    exit 1
+fi
+
 # --------------------------------------------------------------- ABI table ---
 #
 # Expected, straight from the NDK. Columns are <tag> <abi dir> <triple> <min
@@ -556,18 +687,58 @@ ABIS="$NDK_ROOT/meta/abis.json"
 [ -f "$ABIS" ] ||
     die "$ABIS not found; r29 and later ship it, and without it there is nothing to diff"
 
-# `min_os_version` is a field that can disappear, and Google has deleted it: the
-# current meta/abis.json on googlesource ends every ABI object at
-# `llvm_triple`. jq turns an absent key into the string "null", so an
-# unguarded extractor reports all five floors as changed when the NDK did
-# nothing but drop the key. That is a false alarm in the one direction that
-# teaches people to ignore this script, so the key is probed first: absent
-# means the floor is NOT cross-checked, which is neither agreement nor
-# disagreement, and it is said out loud rather than quietly.
-if jq -e 'any(.[]; has("min_os_version"))' "$ABIS" >/dev/null 2>&1; then
+# `min_os_version` is a field that can disappear, and Google may yet delete it:
+# an unguarded extractor reads an absent key as the string "null" and reports
+# all five floors as changed when the NDK did nothing but drop it. That false
+# alarm is the one direction that teaches people to ignore this script, so
+# absence has to be handled -- but as a decision somebody recorded, never as a
+# consequence of the file under test. This key can be deleted from a tree's
+# meta/abis.json, and the probe used to ask `any(.[]; has(...))`: deleting it
+# turned the floor check off and the run stayed green, so src/ndk.zig's
+# 21/21/21/35/21 stopped being enforced with nothing said. The shape of the
+# whole file decides, in three states:
+#
+#   all five carry it   the floor is compared, as before
+#   none carries it     not compared, and only because someone recorded that
+#                       decision: `# min_os_version: absent` in the pin file
+#   some carry it       refused: a partial table has no floor to compare and no
+#                       honest reading of "not cross-checked"
+#
+# jq's parse error is reported here, by name, before any conclusion is drawn
+# from a file it could not read. The old probe swallowed it into the
+# "declares no min_os_version" branch, printed that claim about a file that did
+# not parse, and then died on jq's own exit code 5 -- a status this script's
+# header does not document and no wrapper testing `== 1` expects.
+if ! jq -e 'type == "object" and length > 0 and all(.[]; type == "object" and has("triple"))' \
+    "$ABIS" >/dev/null 2>"$WORK/jq-shape.err"; then
+    printf 'sync-ndk: %s is not a meta/abis.json this script understands.\n' "$ABIS" >&2
+    printf 'Each ABI entry must be an object carrying a "triple". jq said:\n' >&2
+    sed 's/^/  /' "$WORK/jq-shape.err" >&2
+    exit 1
+fi
+
+if jq -e 'all(.[]; has("min_os_version"))' "$ABIS" >/dev/null 2>&1; then
     MIN_OS_PRESENT=1
     COLUMNS_DESC="<tag> <abi dir> <triple> <min api>"
+elif jq -e 'any(.[]; has("min_os_version"))' "$ABIS" >/dev/null 2>&1; then
+    printf 'sync-ndk: %s carries min_os_version on some ABIs and not others.\n' "$ABIS" >&2
+    printf 'A partial floor table has no value to compare and no honest reading\n' >&2
+    printf 'of "not cross-checked", so it is refused rather than half applied.\n' >&2
+    printf '  with the key:    %s\n' \
+        "$(jq -r 'to_entries[] | select(.value | has("min_os_version")) | .key' "$ABIS" | LC_ALL=C sort | tr '\n' ' ')" >&2
+    printf '  without the key: %s\n' \
+        "$(jq -r 'to_entries[] | select(.value | has("min_os_version") | not) | .key' "$ABIS" | LC_ALL=C sort | tr '\n' ' ')" >&2
+    exit 1
 else
+    if ! grep -q '^# min_os_version: absent' "$RECORD"; then
+        printf 'sync-ndk: %s declares no min_os_version on any ABI, so the per-ABI\n' "$ABIS" >&2
+        printf 'floor cannot be cross-checked -- and this run refuses to decide that\n' >&2
+        printf 'for itself. Deleting one JSON key used to switch this check off in\n' >&2
+        printf 'silence; it is now a decision someone has to record in %s:\n' "$RECORD" >&2
+        printf '  # min_os_version: absent\n' >&2
+        printf 'Add that line, say why in CHANGELOG.md, and run this again.\n' >&2
+        exit 1
+    fi
     MIN_OS_PRESENT=0
     COLUMNS_DESC="<tag> <abi dir> <triple>"
 fi
@@ -580,7 +751,7 @@ else
     jq -r 'to_entries[]
         | [ (.key | gsub("-"; "_")), .key, .value.triple ]
         | @tsv' "$ABIS" | LC_ALL=C sort >"$WORK/expected.tsv"
-    printf 'min api:    this NDK declares no min_os_version; the per-ABI floor is NOT cross-checked\n'
+    printf 'min api:    this NDK declares no min_os_version on any ABI; the per-ABI floor is NOT cross-checked, as recorded in %s\n' "$RECORD"
 fi
 
 # Actual, scraped from the three accessors in src/ndk.zig. This is text
@@ -588,7 +759,7 @@ fi
 # three functions: each is a `pub fn <name>(` line ending at the next line that
 # starts in column zero. A reshape of them is a change this script must be
 # taught, and the count check below is what says so out loud.
-awk -v tagfile="$WORK/declared.tsv" '
+awk -v tagfile="$WORK/declared.tsv" -v blindfile="$WORK/blind.txt" '
     # Scoped to the Abi enum on purpose: HostTag.directoryName has the same
     # name and would otherwise contribute host tags to the ABI table.
     /^pub const Abi = enum \{/  { in_abi = 1; next }
@@ -639,11 +810,27 @@ awk -v tagfile="$WORK/declared.tsv" '
         }
     }
     END {
-        for (tag in seen) printf "%s\t%s\t%s\t%s\n", tag, dir[tag], trip[tag], min[tag]
+        for (tag in seen) {
+            # A row that scraped nothing is not a row the diff can read. The
+            # counts still match, so a renamed accessor came out as a blank
+            # column and was then reported as NDK drift for an edit made in
+            # this repository. Named here instead, before anything is compared.
+            if (dir[tag] == "" || trip[tag] == "" || min[tag] == "") print tag > blindfile
+            printf "%s\t%s\t%s\t%s\n", tag, dir[tag], trip[tag], min[tag]
+        }
         for (declared_tag in declared) print declared_tag > tagfile
         close(tagfile)
+        close(blindfile)
     }
 ' "$TABLE" | LC_ALL=C sort >"$WORK/actual.tsv"
+
+if [ -s "$WORK/blind.txt" ]; then
+    printf 'sync-ndk: the extractor matched an ABI with an empty column in\n' >&2
+    printf 'src/ndk.zig, so a diff below would report NDK drift for a rename made\n' >&2
+    printf 'in this repository. Nothing was compared against the NDK.\n' >&2
+    printf '  blind on: %s\n' "$(tr '\n' ' ' <"$WORK/blind.txt")" >&2
+    exit 1
+fi
 
 # The other side of the same probe: with no floor to compare, the scraped floor
 # column is dropped rather than diffed against nothing.
@@ -714,8 +901,8 @@ if [ "$TABLE_OK" -ne 1 ]; then
 fi
 
 if [ "$ACCEPT" -eq 1 ] && [ "$IDENTITY_OK" -ne 1 ]; then
-    # One awk pass writes all five facts into a staging file beside the pin, and
-    # one rename puts it in place.
+    # One awk pass writes four facts into a staging file beside the pin, and one
+    # rename puts it in place.
     #
     # `sed -i` would have been shorter and is not portable: BSD sed requires an
     # argument to -i and errors without one, so --accept was broken on
@@ -730,12 +917,11 @@ if [ "$ACCEPT" -eq 1 ] && [ "$IDENTITY_OK" -ne 1 ]; then
     RECORD_TMP="$RECORD.sync-ndk.tmp"
     cp "$RECORD" "$RECORD_TMP"
     awk -v release="$GOT_RELEASE" -v revision="$GOT_REVISION" \
-        -v size="$GOT_SIZE" -v sha256="$GOT_SHA" -v sha1="$GOT_SHA1" '
+        -v size="$GOT_SIZE" -v sha256="$GOT_SHA" '
         /^release = /  { print "release = " release;  next }
         /^revision = / { print "revision = " revision; next }
         /^size = /     { print "size = " size;      next }
         /^sha256 = /   { print "sha256 = " sha256;  next }
-        /^sha1 = /     { print "sha1 = " sha1;      next }
         { print }
     ' "$RECORD" >"$RECORD_TMP"
 
@@ -746,9 +932,13 @@ if [ "$ACCEPT" -eq 1 ] && [ "$IDENTITY_OK" -ne 1 ]; then
     # one. The usage text says "review the diff first" and used to print the
     # other file's.
     if diff -u "$RECORD" "$RECORD_TMP" >"$WORK/record.diff"; then
-        printf '\nsync-ndk: --accept found nothing to write: every pinned fact in\n' >&2
-        printf '%s already equals what this NDK resolves to, which contradicts the\n' "$RECORD" >&2
-        printf 'checks above. Nothing was modified.\n' >&2
+        printf '\nsync-ndk: --accept has nothing to write.\n' >&2
+        printf 'Every fact it does write in %s already equals what this NDK\n' "$RECORD" >&2
+        printf 'resolves to, which is what the checks above say rather than a\n' >&2
+        printf 'contradiction of them. The one that can still differ is sha1:\n' >&2
+        printf 'it is not written here at all, because it is the publisher value\n' >&2
+        printf 'and not one this machine computes. If it moved, replace that line\n' >&2
+        printf 'by hand from repository2-3.xml. Nothing was modified.\n' >&2
         exit 1
     fi
     printf '\nabout to write %s. Left is on disk now, right is what this NDK\n' "$RECORD"
@@ -759,11 +949,12 @@ if [ "$ACCEPT" -eq 1 ] && [ "$IDENTITY_OK" -ne 1 ]; then
     RECORD_TMP=""
 
     printf '\naccepted. %s now records:\n' "$RECORD"
-    printf '  release  %s\n  revision %s\n  size     %s\n  sha256   %s\n  sha1     %s\n' \
-        "$GOT_RELEASE" "$GOT_REVISION" "$GOT_SIZE" "$GOT_SHA" "$GOT_SHA1"
-    printf '\nsha1 is the publisher value and has to be replaced by hand: Google\n'
-    printf 'states it in repository2-3.xml, and this script does not fetch it.\n'
-    printf 'The other four came from the artefact in front of it.\n'
+    printf '  release  %s\n  revision %s\n  size     %s\n  sha256   %s\n' \
+        "$GOT_RELEASE" "$GOT_REVISION" "$GOT_SIZE" "$GOT_SHA"
+    printf '\nsha1 was NOT written, and that is deliberate: this script does not\n'
+    printf 'fetch it, so any value it computed would be its own number wearing\n'
+    printf 'Google'"'"'s label. The line is left as recorded -- compare it with the\n'
+    printf 'digest in repository2-3.xml and replace it by hand if it moved.\n'
     printf '\nThe ABI table already matched this NDK. Add an entry to CHANGELOG.md\n'
     printf 'saying what moved, and re-run this script with no flags to confirm.\n'
     exit 0

@@ -1,11 +1,20 @@
-# zig-ndk — no upstream code is redistributed here.
+# zig-ndk.
 #
-# This package ships Zig source that *describes* an Android NDK sysroot. It
-# contains no C, no NDK header, and no part of any Google or LLVM artefact.
-# The Android NDK itself is licensed by its publisher and is not vendored,
-# copied or relicensed by this file; it is read at build time from wherever
-# the consumer's NDK lives. Nothing in this repository derives from the NDK's
-# own source.
+# This package ships Zig source that *describes* an Android NDK sysroot. No
+# NDK, Google or LLVM artefact is redistributed in this tree: it contains no C,
+# no NDK header, and no part of any Google or LLVM binary. The NDK itself is
+# licensed by its publisher, is not vendored or copied here, and is read at
+# build time from wherever the consumer's NDK lives.
+#
+# Portions of this repository are reproduced from the Zig standard library. See
+# NOTICE.md for what was taken, from where, and why.
+#
+# The Android NDK is not MIT licensed, and nixpkgs does not classify it as free.
+# `devenv.nix` and the CI `link` job download and unpack NDK r29 under Google's
+# Android SDK Terms — https://developer.android.com/studio/terms, reproduced on
+# the download page at https://developer.android.com/ndk/downloads — so entering
+# `devenv shell` downloads a licence-restricted artefact. Read those terms
+# before you do. This repository takes no position on what they allow.
 
 MIT License
 

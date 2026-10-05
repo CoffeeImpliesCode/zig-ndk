@@ -1,12 +1,40 @@
 # The pinned Android NDK release.
 #
+# Which of these lines belong to the tool. `tools/sync-ndk.sh --accept` rewrites
+# FOUR of the five `key = value` lines at the bottom of this file -- release,
+# revision, size and sha256 -- and nothing else: every other line, this header
+# included, is printed through unchanged. Two rules for anyone editing them:
+#
+#   1. Keep the ` = ` spacing. Both the script's reader and its writer match a
+#      line by `^<key> = `, so `sha256=...` or `sha256  = ` is invisible to
+#      them: --accept silently stops rewriting that key, and the next run
+#      refuses with "does not carry all five pinned facts", naming a missing
+#      fact rather than the missing space that caused it.
+#   2. sha1 is written by no run of this repository, on purpose. It is the
+#      publisher's number, transcribed from repository2-3.xml, and --accept
+#      used to overwrite it with a sha1sum of the local archive -- this
+#      machine's number wearing Google's label, and every later run then
+#      congratulated itself on matching "the publisher digest in the pin".
+#      --accept leaves the line alone and refuses to declare a match it cannot
+#      make; replacing it with the digest from repository2-3.xml is the human's
+#      step, after an NDK bump.
+#
 # One line of evidence per fact, in the order a reader checks them:
 #
 #   release     the NDK's own name for the release   (source.properties, Pkg.ReleaseName)
 #   revision    the NDK's own revision                (source.properties, Pkg.Revision)
-#   size        the byte length of the zip below      (wc -c, and Google's <size> agrees)
-#   sha256      the zip, computed locally             (sha256sum)
-#   sha1        the zip, as Google publishes it       (repository2-3.xml, <checksum type="sha1">)
+#   size        the byte length of that archive       (wc -c, and Google's <size> agrees)
+#   sha256      that archive, computed locally        (sha256sum)
+#   sha1        that archive, as Google publishes it  (repository2-3.xml, <checksum type="sha1">)
+#
+# Which archive is deliberately not named here: this file records what the
+# release IS, while a URL is a fact about where somebody downloads it, and it
+# moves on its own schedule. The URL is in .github/workflows/ci.yml
+# (NDK_ZIP_URL) and in devenv.nix (ndkUrl); both name the same
+# https://dl.google.com/android/repository/android-ndk-r29-linux.zip that the
+# values at the bottom of this file were computed from. `tools/sync-ndk.sh`
+# fetches nothing either -- it hashes the archive it is handed, or the one it
+# finds beside the tree, and compares that against these five lines.
 #
 # The two digests have different provenances and the difference is not
 # cosmetic. Google publishes SHA-1 for NDK archives and nothing else: the
