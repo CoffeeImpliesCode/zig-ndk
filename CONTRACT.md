@@ -8,10 +8,16 @@ observation**.
 
 ## 1. The problem, established by execution
 
-Zig 0.16.0 ships **zero** NDK awareness. A full-tree grep for `ndk` in
-`lib/std` hits only `libcxx/include/__locale_dir/locale_base_api/android.h`
-(upstream libc++ code) and unrelated ML-KEM `Ndk` fields. `lib/std/Build.zig`
-contains no android reference at all.
+Zig 0.16.0 ships **zero** NDK awareness. Grepping `lib/` for `ndk` across the
+whole tree finds exactly three real things: `lib/libcxx/include/__locale_dir/locale_base_api/android.h`
+(upstream libc++ code, gated on `__has_include(<android/ndk-version.h>)`),
+the ML-KEM `Ndk` decapsulation-key length field in `lib/std/crypto/hybrid_kem.zig`,
+and a ReactOS NDIS header URL in `lib/std/os/windows.zig:5843`. Inside
+`lib/std` there is no NDK support code at all, and `lib/std/Build.zig`
+contains no `android` reference whatsoever.
+
+Note the path: that libc++ file is under `lib/libcxx`, not `lib/std/libcxx`,
+which does not exist. A grep rooted at `lib/std` cannot return it.
 
 Four probes, run against Zig 0.16.0 on this host, the last of them against the
 unpacked NDK r29 sysroot:
@@ -228,17 +234,30 @@ Module `ndk`, root `root.zig`:
 | `Ndk.readVersion` | fn | `Pkg.Revision` from `source.properties`, or `VersionUnreadable` |
 | `Ndk.Version` | struct | A parsed `Pkg.Revision` — the version code to pin a build against |
 | `Ndk.Probes` | struct | Both layouts a candidate root was probed under, with the host tag |
+| `Ndk.Probes.Entry` | struct | One probed layout: its `Shape`, the `ndk_root` it would be under, and the `sysroot` path it would resolve to |
 | `Ndk.probeCandidates` | fn | Build that `Probes` value, for a diagnostic |
 | `Ndk.describeProbeFailure` | fn | Render it into a caller's `std.Io.Writer`. This is how D3's promise is discharged |
 | `LibcPaths` | struct | The six-field paths file Zig's `LibCInstallation.parse` demands. `forAndroid`, `render`, `deinit` |
 | `Error` | error set | Every refusal a caller can act on. Six members, unchanged throughout |
 
-Ownership: an `Ndk` is a **borrowed view of a directory tree**. It owns no
-memory — every path is stored as a caller-supplied slice or a build-runner
-slice whose lifetime is the build. There is no `deinit`, and that is the
-documented contract, not an omission. A caller who needs a path after the
-build run must copy it into its own storage; `deinit` is deliberately absent so
-that a caller cannot believe a `Ndk` owns anything.
+Ownership is per type, and the three types differ deliberately. Getting this
+wrong is a leak or a double free, so each is stated rather than implied.
+
+| Type | Owns | Release |
+|---|---|---|
+| `Ndk` | nothing. Every slice it stores was **allocated from the allocator you passed** to `find` or `open` — not from your input buffer, so `root_path` never aliases what you handed in | **no `deinit`, by design** |
+| `Ndk.Probes` | its paths, including each `Entry`'s | `Probes.deinit(gpa)` |
+| `LibcPaths` | `include_dir`, `sys_include_dir`, `crt_dir` — `forAndroid` copies all three | `LibcPaths.deinit(gpa)` |
+
+An `Ndk` having no `deinit` is a contract, not an omission: a caller who needs a
+path after the build must copy it into storage it owns, and the absence stops a
+caller believing the value owns anything.
+
+**The one ownership trap:** `msvc_lib_dir`, `kernel32_lib_dir` and `gcc_dir` are
+**borrowed, not owned**. `forAndroid` leaves them `null`, a caller that sets them
+sets them to memory it owns, and `deinit` deliberately does not free them.
+Freeing them would abort on a string literal, which is the natural thing to
+assign on a Windows or Haiku path.
 
 Errors are a closed set, never `anyerror`:
 
@@ -257,26 +276,56 @@ demands the version. The reader reports it; discovery does not fail on it.
 
 ## 5. What is not claimed
 
-- **The positive libc link was proven by `zig build-exe`, not by `zig build`.**
-  Probe 4 in §1 is an exercised compilation of a single trivial `pub fn main`
-  against one ABI (`aarch64-linux-android`, API 35, r29). What remains
-  unproven until phase 5 is green: that the same thing works through this
-  package's own `build.zig` wiring, and for the other four ABIs and their API
-  levels. The mechanism is no longer a prediction; its per-ABI coverage is.
-- **No claim about any other NDK revision.** r29 was read. r30 exists and is the
-  current LTS; r27/r28 layouts were not verified on this host.
+- **The bionic link through `build.zig` is observed, for two ABIs, both at
+  API 35.** `zig build ndk-link-check` with `ANDROID_NDK_HOME` set exits 0 and
+  writes `zig-out/bin/ndk-link-check`, which the gate's own ELF check reads
+  back and which `file(1)` reports as an aarch64 Android PIE with interpreter
+  `/system/bin/linker64`, for Android 35, built by NDK r29. Measured matrix:
+
+  | ABI | API | Result |
+  |---|---|---|
+  | `arm64-v8a` | 35 | links |
+  | `riscv64` | 35 | links |
+  | `arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64` | 21 | **`undefined symbol: preadv64` / `pwritev64`** |
+
+  That API-21 failure is **bionic plus Zig's default panic handler, not the NDK
+  wiring**: the libc paths file resolves and the paths-file helper succeeds at
+  every level, and the boundary is the API level rather than the ABI — the same
+  ABI is green at 35 and red at 21. bionic gained `preadv64` and `pwritev64` at
+  API 24, and Zig's default panic path reaches `std.Io.Threaded`, which calls
+  both. `ReleaseSmall` and `ReleaseFast` drop that reference and do link at 21.
+
+  So the usable floor for a Debug build is **API 24**, not the 21 the NDK
+  declares for four of the five ABIs. That gap is recorded rather than worked
+  around: forcing the gate to `ReleaseSmall` would silently discard the
+  caller's `-Doptimize` and hide Debug link failures, which is a worse gate
+  than a red one with a known cause. The other three ABIs at API 24 or above
+  have **not** been observed linking.
+- **No claim about any other NDK revision.** r29 was read, and r29 is now on
+  Google's unsupported-downloads list. r30 is the current LTS at
+  `30.0.16248370`, tagged 2026-09-08; its changelog changes only the LLVM
+  version and the maximum API, so this pin is behind rather than chosen — but
+  the bump has not been made or verified here. r27/r28 were not read.
 - **No claim about `ndk-build` or the CMake toolchain file**, by scope.
 - **No speed, size, or throughput claim.** Nothing here was measured.
 - **No runtime observation.** The linked Android binary was never executed; it
   cannot be, on this host. Everything claimed of it is what `file(1)` reads
   from its headers.
+- **The compiler record is 0.16.0, and it is no longer the newest.** Zig 0.17.0
+  shipped 2026-10-01. `.minimum_zig_version` is advisory in 0.16.0 and enforces
+  nothing, so nothing here would refuse a 0.17 build — and every `file:line`
+  citation in this document is anchored to 0.16.0 and has not been re-checked
+  against 0.17.0.
 
 ## 6. Gate ladder
 
 Per the foundation per-fork contract §4.3, adapted: this package has no C of its
-own, so items 2, 3 and 6 apply in their Zig-only form, and the ABI gate (from
-`libffi`'s `abicheck/`) becomes a **path-agreement gate**: for every ABI and
-every API level, the path the library computes must be a directory that exists.
+own, so items 2, 3 and 6 apply in their Zig-only form. The `libffi` `abicheck/`
+pattern has no direct analogue here, because there is no vendored C whose layout
+could drift from a header: the thing that can drift is the **NDK's own layout
+facts**, and those are guarded by `tools/sync-ndk.sh` (which diffs `src/ndk.zig`
+against a real NDK's `meta/abis.json`) and by `ndk-link-check`, which fails
+unless a real bionic binary for the selected ABI comes out the other end.
 
 | Gate | Command | What a green run establishes |
 |---|---|---|
@@ -285,5 +334,8 @@ every API level, the path the library computes must be a directory that exists.
 | cross compile | `zig build ndk-abi-check` | each ABI's `std.Build` target query resolves and the module compiles for it |
 | libc link | `zig build ndk-link-check` | Zig links a bionic Android binary against the real sysroot |
 
-The last gate is the one that decides whether this package is useful. Until it
-is green, `ndk-link-check` is the honest name for what is being attempted.
+`ndk-link-check` is the gate that decides whether this package is useful, and it
+is the only one that reads an artefact back — an install plus an ELF identity
+check, so a compile that emits nothing fails rather than passing. It was
+observed green for `arm64-v8a` and `riscv64` at API 35; see §5 for the full
+matrix and the API-24 floor.

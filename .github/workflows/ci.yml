@@ -6,13 +6,19 @@
 #   zig build test            host unit tests, b.addTest + b.addRunArtifact
 #   zig build ndk-abi-check   one cross-compiled test binary per NDK ABI
 #   zig build ndk-link-check  links a real bionic binary against a real sysroot
+#   zig build sync-ndk        NDK drift enforcer: fails if a pinned fact or
+#                             the copied ABI table has moved. The only gate
+#                             besides ndk-link-check that needs an NDK; in
+#                             `all`, not in `check`, which must stay NDK-free.
 #   zig build check           test + ndk-abi-check (the contract gate; the
 #                             test and cross jobs below run its two halves)
 #
-# The link job is the only one that provisions the pinned NDK, because
-# ndk-link-check is the only gate that reads a sysroot. The other three gates
-# prove something that needs no NDK at all, and a green run for each is the
-# evidence that the sysroot stays optional.
+# The link job is the only one that provisions the pinned NDK, because it is
+# the only job that runs a gate needing one: ndk-link-check reads a sysroot,
+# and sync-ndk compares this package's recorded release, digests and ABI
+# table against a real unpacked NDK. Both run there, on one download. The
+# other three gates prove something that needs no NDK at all, and a green run
+# for each is the evidence that the sysroot stays optional.
 #
 # --- Known gap: foundation contract §4.3 item 5, Tier-2 host targets --------
 # The contract asks for cross-compilation gates on x86_64-linux (Tier 1) and
@@ -59,10 +65,36 @@ defaults:
     shell: bash
 
 env:
-  # Zig 0.16.0 is the compiler this package targets: `.minimum_zig_version` in
-  # build.zig.zon and `zig_0_16` in devenv.nix are the same pin. The tag, not a
-  # branch — the workflow must not move under a green run.
   ZIG_VERSION: "0.16.0"
+
+  # The Zig pin is not what the other two fields look like.
+  #
+  # `ZIG_VERSION` above is the only machine-enforced compiler pin in this
+  # repository: setup-zig resolves it to that exact release — the tag, not a
+  # branch, so the workflow cannot move under a green run. The other two fields
+  # are not pins and must not be described as one.
+  #
+  #   .minimum_zig_version   advisory. Zig parses and stores it and nothing
+  #                          acts on it (doc/build.zig.zon.md:65), so a 0.17
+  #                          build would not be refused by it.
+  #   zig_0_16               a floating nixpkgs attribute (devenv.nix:61). It
+  #                          resolves to whatever devenv.lock's nixpkgs-src rev
+  #                          provides, currently
+  #                          c7def046b9a883d46974757852106483d741586f, so the
+  #                          dev shell can drift a patch away from this job's
+  #                          exact 0.16.0 with nothing turning red.
+  #
+  # Every file:line citation in this repository is anchored to 0.16.0 and has
+  # not been re-verified against 0.17.0, which shipped 2026-10-01. Nothing in
+  # this file claims 0.17 works.
+  #
+  # And one measured constraint for anyone wiring per-ABI legs here:
+  # `ndk-link-check` must run at API 35 for all five ABIs, or the API-21 legs
+  # must pass -Doptimize=ReleaseSmall. Bionic did not gain preadv64/pwritev64
+  # until API 24, and Zig's default panic handler reaches both, so an API-21
+  # Debug leg fails on a missing symbol that has nothing to do with the sysroot
+  # description this gate exists to check. Per-ABI minimums wired without this
+  # produce a red CI nobody can explain.
 
   # Repo-local, and already in .gitignore. This is the absolute form of the
   # same directory devenv.nix pins, spelled out because a relative value
@@ -282,6 +314,26 @@ jobs:
             exit 1
           }
           echo "ANDROID_NDK_HOME=${ndk_home}" >> "$GITHUB_ENV"
+
+      # The drift enforcer, placed here because this is the only job that
+      # already has a real unpacked NDK to compare the recorded facts against —
+      # the recorded release, the archive digests, and the copied ABI table.
+      # A job of its own would download and unpack 783 MB a second time for no
+      # extra coverage, and fmt/test/cross must stay green with no NDK at all,
+      # which is exactly what this check cannot be.
+      #
+      # It runs BEFORE the link gate on purpose. If a pinned fact has moved,
+      # the sysroot on disk is no longer the one this package's recorded ABI
+      # table describes, and a green link would be evidence about the wrong
+      # artefact. The drift check is cheap — it reads tools/ndk.sha256 and
+      # parses meta/abis.json — so it fails the job first and leaves the link
+      # gate with nothing left to say.
+      #
+      # A non-zero exit fails the job. This workflow sets `shell: bash`, which
+      # runs each block as `bash -e -o pipefail`, and no step here is marked to
+      # continue past a failure, so the script's exit status becomes the job's.
+      - name: Assert the recorded NDK facts still describe this NDK
+        run: zig build sync-ndk -Dndk="${ANDROID_NDK_HOME}"
 
       # ANDROID_NDK_HOME is the first candidate in build.zig's discovery order;
       # -Dndk is the explicit override above all four, so both the environment

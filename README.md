@@ -15,15 +15,57 @@ itself. Pure Zig. No C, no header, no part of the NDK redistributed.
 | | |
 |---|---|
 | Licence | MIT (`LICENSE`). Nothing upstream is vendored: no C source, no header, no `UPSTREAM`/`NOTICE` file. The tree is Zig only. |
-| Toolchain | Zig 0.16.0, pinned at tag `24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8`, and `.minimum_zig_version = "0.16.0"` in `build.zig.zon` is the same pin. See *Gates* for what has actually been run, and read that section before trusting any status in this table. |
-| NDK pinned | **r29** (`29.0.14206865`), read from the `source.properties` of an unpacked copy on this host, at `/tmp/ndkx/android-ndk-r29`. Release, revision, byte size and SHA-256 are recorded in `tools/ndk.sha256`. |
-| Tests | Two roots, both wired into one step. `b.addTest` over `root.zig` compiles `src/ndk.zig` (24 tests) and `src/libc_file.zig` (4 tests); a second `b.addTest` over `test/integration_test.zig` adds 13, and is wired only while that file is present — its absence is a logged warning, never a silent pass. Command: `zig build test`, which **exits 0** on this host. |
+| Toolchain | Zig 0.16.0 — tag `24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8`, on **Codeberg** (`codeberg.org/ziglang/zig`), which is the only place the 0.16.0 tag exists; `github.com/ziglang/zig` is a moved-to-Codeberg mirror whose tags stop at 0.15.2. Every `file:line` citation in this repository was verified against 0.16.0 specifically. The only machine-enforced compiler pin is CI's `ZIG_VERSION`, which the setup action resolves to that exact release; `.minimum_zig_version = "0.16.0"` in `build.zig.zon` is **advisory** — Zig parses and stores it, and no tool acts on it — so it records a floor as intent, not a refusal. |
+| NDK pinned | **r29** (`29.0.14206865`), as Google's manifest states it: `Pkg.ReleaseName = r29`, `Pkg.Revision = 29.0.14206865`, archive size 783,549,481 bytes. The layout facts below were read from an unpacked r29 and are re-checkable on demand with `tools/sync-ndk.sh` against any unpacked NDK, which is the durable form of that evidence — a scratch path on one host is not. **r30 is shipped and is the current LTS**, and r29 is the first entry on Google's unsupported-downloads list, so this package is verified against a release a full major behind it. See *Which NDK* for why the bump is expected to be cheap. |
+| Tests | Two roots, both wired into one step. `b.addTest` over `root.zig` compiles `src/ndk.zig` (24 tests), `src/libc_file.zig` (5) and root.zig's own unnamed `test { std.testing.refAllDecls(@This()); }`, which the runner counts like any other; a second `b.addTest` over `test/integration_test.zig` adds 13 and is wired only while that file is present — its absence is a logged warning, never a silent pass. **43 tests** in all, which is what `zig build all` reports. Command: `zig build test`, which **exits 0**. |
 | Cross-compiles | `zig build ndk-abi-check` compiles one test binary per ABI and never runs it. **Exits 0** on this host. |
-| Real bionic link | **Observed, for one ABI at one API level: `arm64-v8a` at API 35.** `ANDROID_NDK_HOME=<r29> zig build ndk-link-check` exits 0, `zig-out/bin/ndk-link-check` is written at 4,253,184 bytes, its first four bytes are `\x7fELF`, and `file(1)` reads `ELF 64-bit LSB pie executable, ARM aarch64, dynamically linked, interpreter /system/bin/linker64, for Android 35, built by NDK r29 (14206865)`. The gate installs its artefact and then runs a generated `ndk-elf-check` that reopens the installed file and refuses unless it begins with the ELF magic, so it cannot pass without a binary — verified negatively too: pointed at a text file it fails on the magic, and with the file absent it fails on `FileNotFound`. The other four ABIs are compiled by `ndk-abi-check` but have **not** each been observed linking; run `-Dabi=<name>` to cover one. |
+| Real bionic link | **Observed, for one ABI at one API level: `arm64-v8a` at API 35.** `ANDROID_NDK_HOME=<r29> zig build ndk-link-check` exits 0, `zig-out/bin/ndk-link-check` is written, and `file(1)` reads it as `ELF 64-bit LSB pie executable, ARM aarch64, dynamically linked, interpreter /system/bin/linker64, for Android 35, built by NDK r29 (14206865)`. The gate installs that artefact and then runs a generated `ndk-elf-check` over it, which refuses unless the file is an ELF **for the ABI the gate was asked to build**: `EI_CLASS` must match, `EI_DATA` must be `2LSB`, `EI_OSABI` must be `ELFOSABI_NONE` or `ELFOSABI_ANDROID`, and `e_machine` must be the one `-Dabi=` implies. That is what catches a host executable or a bionic binary for a different ABI, both of which have the right magic. The other four ABIs are compiled by `ndk-abi-check` but have **not** each been observed linking. |
 | Allocates | In the build path only. `Ndk.find`, `Ndk.open`, `Ndk.probeCandidates`, `Ndk.describeProbeFailure`, `Ndk.readVersion`, `Ndk.libcDirFor` and `Ndk.apiLevelsFor` take a caller-supplied allocator. `libcDirFor` and `apiLevelsFor` hand back a slice the caller frees; `probeCandidates` hands back a `Probes`, which *owns* its paths and is released with `Probes.deinit`. The `Ndk` value itself allocates nothing and frees nothing — see *Ownership*. |
 | Runs on Android | **No claim at all.** Nothing in this package was executed on a device or an emulator. |
-| NDK revisions covered | r29 only. r30 exists and is the current LTS; it was not read, and neither were r27 or r28. Nothing above is claimed for any other revision. |
+| NDK revisions covered | **r29 only, and r29 is behind.** r30 (`30.0.16248370`) shipped 2026-09-08 and is the current LTS; r29 is the first entry on Google's unsupported-downloads list. Nothing here was read from, or is claimed for, r30, r27 or r28. See *Which NDK* for what a bump would and would not change. |
+
 | Upstream sync | `tools/sync-ndk.sh` — there is no upstream repository, so this is re-resolve-and-diff, not merge. It re-reads `source.properties`, hashes the archive, re-parses `meta/abis.json` and diffs it against the table in `src/ndk.zig`, exiting non-zero on any change. Run it read-only with `tools/sync-ndk.sh`; this table asserts no result for it, because no run of it was observed while this file was written. |
+
+### Which NDK this package is verified against
+
+r29, and r29 is **behind**: r30 shipped 2026-09-08 and is the current LTS, and
+r29 is the first entry on Google's unsupported-downloads list. Saying so is the
+honest position — nothing here was read from r30 — and it is a defensible one,
+because adopting r30 is expected to change very little. From r30's own
+changelog:
+
+- **Nothing relocates.** The changes listed are LLVM moving to clang-r574158c,
+  simpleperf prebuilts, and "upgraded the max API to 37 for NDK sysroots". No
+  directory moves and nothing is re-namespaced, so the `crt_dir` reasoning in
+  *CHANGELOG* p0005 is untouched.
+- **The ABI set is unchanged.** The same five `meta/abis.json` keys and the same
+  five triples.
+- **The API-level change is picked up automatically.** `Ndk.apiLevelsFor`
+  enumerates the numeric directories on disk rather than carrying a table of
+  levels, so a new maximum appears on its own.
+
+The one number r30 does touch is the link gate's default `-Dapi=35`, and 35
+still exists in r30 — so the default keeps working. A bump is then mostly
+`tools/ndk.sha256` plus the two comptime pins in `root.zig`, which fail the
+build if the table moved. This is stated so the decision is the reader's to
+make rather than something they have to guess at.
+
+### Other Zig packages that touch Android
+
+Two exist and neither does what this one does, which is worth a paragraph
+because one of them collides by name:
+
+- **`silbinarywolf/zig-android-sdk`** resolves the Android SDK and NDK and
+  builds APKs — acquisition and packaging. It publishes a module named `ndk`,
+  but that module is Android's `log` binding, not a sysroot descriptor, so the
+  shared name is a collision and not an overlap. Its README pins
+  `ndk_version = "29.0.13113456"`, a revision Google does not publish; the real
+  r29 is `29.0.14206865`.
+- **`ikskuh/ZigAndroidTemplate`** is project scaffolding, and its last activity
+  predates this package's NDK pin.
+
+This package is the sysroot descriptor and the six-field paths file, and
+nothing else: no SDK acquisition, no APK packaging, no project template.
 
 ### Gates
 
@@ -34,20 +76,21 @@ that it was run and failed.
 
 | Gate | Command | What a green run establishes | Needs an NDK? | Observed |
 |---|---|---|---|---|
-| fmt | `zig build fmt-check` | formatting | no | not established here |
+| fmt | `zig build fmt-check` | formatting | no | **2/2 steps pass** |
 | host tests | `zig build test` | libc paths file parsing and rendering, discovery order, error paths, on the host target | no | **exits 0** |
 | cross compile | `zig build ndk-abi-check` | each ABI's `std.Build` target query resolves and the module compiles for it | no | **exits 0** |
-| libc link | `zig build ndk-link-check` | Zig links a bionic Android binary against the real sysroot, **and** the installed artefact is read back and confirmed to be an ELF | **yes** | **exits 0 and writes `zig-out/bin/ndk-link-check`**, a 4,253,184-byte aarch64 Android PIE with interpreter `/system/bin/linker64`, for `arm64-v8a` at API 35 |
+| libc link | `zig build ndk-link-check` | Zig links a bionic Android binary against the real sysroot, **and** the installed artefact is read back and confirmed to be an ELF for the requested ABI | **yes** | **exits 0 and writes `zig-out/bin/ndk-link-check`**, an aarch64 Android PIE with interpreter `/system/bin/linker64`, for `arm64-v8a` at API 35 |
 | local aggregate | `zig build check` | `test` + `ndk-abi-check`, in one run | no | **exits 0** |
-| CI contents | `zig build test` **and** `zig build ndk-abi-check` | exactly what the two CI jobs run, which together equal `zig build check` | no | see *.github/workflows/ci.yml* |
-| everything | `zig build all` | `check` + `fmt-check` + `ndk-link-check` | **yes** | not established here |
+| everything | `zig build all` | `check` + `fmt-check` + `ndk-link-check` | **yes** | **24/24 steps, 43/43 tests** |
 
-**CI never invokes `zig build check`.** `.github/workflows/ci.yml` splits it:
-the `test` job runs `zig build test` and the `cross` job runs
-`zig build ndk-abi-check`, as two jobs with two caches. The `check` step exists
-for a local one-command run, and the two jobs are what CI actually executes.
-There is no CI job named for `fmt-check` or `ndk-link-check` either — the
-workflow has separate `fmt` and `link` jobs that do run them.
+**CI runs four of these gates across five jobs, and never `zig build check`.**
+`.github/workflows/ci.yml` has `fmt` (`zig build fmt-check`), `test`
+(`zig build test`), `cross` (`zig build ndk-abi-check`), `link`
+(`zig build ndk-link-check`, with the NDK provisioned only there) and
+`licence`. The `test` and `cross` jobs together run exactly the two steps
+`zig build check` depends on, so CI's two jobs equal the local aggregate —
+but CI splits them across two jobs and two caches, and runs two gates `check`
+does not: `fmt-check` and `ndk-link-check`.
 
 **What the link gate covers, and what it does not.** It was observed green on
 one ABI at one API level: `arm64-v8a` at API 35. `-Dabi=<name>` and `-Dapi=<n>`
@@ -58,10 +101,15 @@ is established, both by the manual probe in *The problem* and by this gate.
 
 ## The problem
 
-Zig 0.16.0 ships zero NDK awareness. A full-tree grep for `ndk` in `lib/std`
-hits only `libcxx/include/__locale_dir/locale_base_api/android.h` (upstream
-libc++ code) and unrelated ML-KEM `Ndk` fields; `lib/std/Build.zig` contains no
-android reference at all.
+Zig 0.16.0 ships zero NDK awareness. A case-insensitive search for `ndk` across
+`lib/std` returns only incidental matches: ML-KEM's `Ndk` decap-key fields in
+`crypto/hybrid_kem.zig`, `BlindKeyPair` and `expandKey` in
+`crypto/25519/ed25519.zig` and `crypto/aes/soft.zig`, a ReactOS NDIS header URL
+at `os/windows.zig:5843`, and `FoundKey` at `zig/LibCInstallation.zig:45` —
+that last only because the word contains the substring. Not one is about
+Android. The libc++ header this project is really up against lives outside
+`lib/std`, under `lib/libcxx/`; `lib/std` has no `libcxx` directory for a grep
+to return. `lib/std/Build.zig` contains no android reference at all.
 
 Four probes, run by hand against Zig 0.16.0 on this host, the last of them
 against the unpacked NDK r29 sysroot. **None of them went through this
@@ -91,10 +139,13 @@ dynamically linked, interpreter /system/bin/linker64, for Android 35,
 built by NDK r29 (14206865), with debug_info, not stripped
 ```
 
-**That binary came from the manual `zig build-exe` probe above.** It did not
-come from `zig build ndk-link-check`, which does not currently emit an ELF at
-all — see *Gates*. Read this block as evidence that the mechanism works against
-a real r29 sysroot, and as nothing at all about the package's own link gate.
+**That binary came from the manual `zig build-exe` probe above**, so it
+evidences the *mechanism* — that Zig links bionic when handed this paths file
+and this sysroot — rather than this package's wiring. The package's own gate
+now produces the same artefact through `build.zig`:
+`zig build ndk-link-check` writes `zig-out/bin/ndk-link-check`, and `file(1)`
+reads the same ELF type, interpreter, API level and NDK revision off it. See
+*Gates*.
 
 That line is the whole product in one string. Zig compiled the binary, and
 bionic supplied the loader, the CRT and `libc`. `/system/bin/linker64` is the
@@ -117,10 +168,10 @@ is what this package fills. It is the whole scope.
 The published module is the **facts half**: ABI names, sysroot triples, API
 levels and sysroot paths, readable from your own Zig code. The **build half** —
 turning those facts into a compiled Android binary — is four `pub` declarations
-at the end of this package's `build.zig`: `abi_directory_names`,
-`AndroidLinkOptions`, `ResolvedNdk` and `linkAndroid`. They are separate on
-purpose: a consumer who only reads the layout should not pull `std.Build` into
-their import table.
+in this package's `build.zig`: `abi_directory_names`, which sits above
+`pub fn build`, and then `AndroidLinkOptions`, `ResolvedNdk` and `linkAndroid`
+after it. They are separate on purpose: a consumer who only reads the layout
+should not pull `std.Build` into their import table.
 
 **The dependency is named `zig_ndk`, with an underscore.** `build.zig.zon`
 declares `.name = .zig_ndk`, an enum literal, and 0.16 takes the package name
@@ -196,18 +247,26 @@ and sets `compile.root_module.link_libc` so the build runner emits `-lc`. It
 returns the generated paths file and the root it was computed from, so you can
 name the installation in your own diagnostics.
 
-**Read that last sentence as a mechanism, not as a claim that the link
-happens.** `link_libc = true` selects the libc *installation* — the paths file
-Zig reads for headers and CRT objects. It does not put `libc.so` on the link
-line; that needs `compile.linkSystemLibrary("c")`, which `linkAndroid` does not
-call today. A dynamic link with lld and no shared library at all does not fail,
-it produces no binary — which is exactly what `zig build ndk-link-check` does
-now. A consumer who calls `linkAndroid` and wants a real bionic binary must
-add the `libc` system library themselves until this package does it:
+**It wires a compilation; it does not produce a binary, and that is not a libc
+problem.** A `Step.Compile` nobody consumes emits nothing: the build runner
+passes `-fno-emit-bin` while `generated_bin` is null
+(`lib/std/Build/Step/Compile.zig:1406`), so the compile step succeeds having
+written no file anywhere. Something has to allocate that field — a
+`b.addInstallArtifact`, a `b.addRunArtifact`, or a caller that consumes the
+artefact. A consumer who wants the binary needs one of those:
 
 ```zig
-exe.linkSystemLibrary("c");
+const installed = b.addInstallArtifact(exe, .{});
 ```
+
+Nothing is missing from the *link* side, and adding a `c` system library would
+be a no-op: `Module.linkSystemLibrary("c", …)` never reaches the library list,
+because the name is intercepted first and rewritten to `m.link_libc = true`
+(`lib/std/Build/Module.zig:371-374`) — which `linkAndroid` already sets, and
+`link_libc` is what puts `-lc` on the command line
+(`Step/Compile.zig:1355-1356`). This is the failure the whole package exists to
+prevent: a green build step that proves nothing, because nothing read back what
+it produced.
 
 Three things it deliberately does not do:
 
@@ -306,15 +365,18 @@ a directory that is not there.
 
 ## Ownership
 
-An `Ndk` is a **borrowed view of a directory tree**. It owns no memory. Every
-path it hands back is either a slice you supplied or a slice whose lifetime is
-the build run.
-
-There is no `deinit`. That absence is the contract, not an omission: a type
+An `Ndk` is a **borrowed view of a directory tree**. It owns no memory and has
+no `deinit`, and that absence is the contract rather than an omission: a type
 that cannot be freed cannot be believed to own anything, so a caller who needs
-a path after the run has to copy it into storage it owns. Verified against
-`src/ndk.zig`: the struct declares `root_path`, `host_tag`, `sysroot_path` and
-`shape`, and no `deinit`.
+a path after the build run has to copy it into storage it owns.
+
+**Every slice an `Ndk` stores was allocated from the allocator you passed to
+`find` or `open`** — `root_path`, `sysroot_path` and the `Probes` paths alike.
+Nothing it holds aliases your input buffer, and nothing it holds is a
+build-runner slice it happened to be handed; in a build script that allocator
+is the build runner's, whose lifetime is the build. Verified against
+`src/ndk.zig`: `Ndk` declares `root_path`, `host_tag`, `sysroot_path` and
+`shape`, no `deinit`, and `resolve` allocates every path it stores.
 
 Three things in this package are **not** borrowed, and the asymmetry is
 deliberate:
@@ -326,22 +388,33 @@ deliberate:
   branch, and an `Ndk` is only ever constructed on success — which is why one
   can afford to own nothing and the other cannot. `Ndk.describeProbeFailure`
   builds one internally and frees it before returning.
-- **`LibcPaths`**, re-exported from `root.zig`, owns its three paths.
-  `forAndroid` copies what you hand it and `deinit(gpa)` releases the copies,
-  so a `LibcPaths` outlives the strings it was built from. `Ndk.Version` is a
-  value type: it owns nothing and has no `deinit`.
+- **`LibcPaths`**, re-exported from `root.zig`, owns three of its six fields.
+  `forAndroid` copies `include_dir`, `sys_include_dir` and `crt_dir`, and
+  `deinit(gpa)` releases exactly those three, so a `LibcPaths` outlives the
+  strings it was built from. `Ndk.Version` is a value type: it owns nothing and
+  has no `deinit`.
+
+**The trap is the three fields `LibcPaths.deinit` deliberately does not touch.**
+`msvc_lib_dir`, `kernel32_lib_dir` and `gcc_dir` are **borrowed**: `forAndroid`
+leaves them `null`, a caller that sets one sets it to memory it owns, and
+`deinit` never frees them. That is not an oversight. All three are `null` for
+every Android target, so `forAndroid` never takes them, and freeing a borrowed
+slice would abort on the string literal a caller naturally writes into
+`.gcc_dir = "/some/path"` on a Haiku build.
 
 ## What the tests do, and what they do not
 
-**41 tests, 28 of them under one `b.addTest` root and 13 under a second.**
-`b.addTest` over `root.zig` compiles every `test` block reachable from that
-root, which is `src/ndk.zig` (24) and `src/libc_file.zig` (4) — both are
-re-exported by `root.zig`, so a `test` block added to either is picked up
-without a second file to keep in sync. A second `b.addTest` over
+**43 tests: 30 under one `b.addTest` root, 13 under a second.** `b.addTest`
+over `root.zig` compiles every `test` block reachable from that root — 24 in
+`src/ndk.zig`, 5 in `src/libc_file.zig`, both re-exported by `root.zig`, so a
+`test` block added to either is picked up without a second file to keep in
+sync — plus root.zig's own unnamed `test { std.testing.refAllDecls(@This()); }`,
+which the runner counts like any other. A second `b.addTest` over
 `test/integration_test.zig` adds 13, and `build.zig` wires it only while that
-file is present; its absence is a `std.log.warn`, never a silent pass. All of
-them run on the host and none touches a real NDK — every tree they assert
-against is constructed under a scratch directory.
+file is present; its absence is a `std.log.warn`, never a silent pass. 24 + 5 +
+1 + 13 is the 43/43 `zig build all` reports. All of them run on the host and
+none touches a real NDK — every tree they assert against is constructed under a
+scratch directory.
 
 Covered, for the libc paths file: that `forAndroid` copies its paths rather than
 borrowing the caller's literals; that `render` writes all six keys, with the
@@ -377,14 +450,26 @@ Not covered, and stated rather than implied:
   Android is claimed anywhere in this package. The linked binary in *The
   problem* was never executed — it cannot be, on this host — and everything
   said about it is what `file(1)` reads out of its headers.
-- **The bionic link was exercised once, by a manual `zig build-exe`, for
-  `aarch64-linux-android` at API 35.** It was not exercised through this
-  package's own `build.zig`, and it was not exercised for the other four ABIs or
-  their API levels. `ndk-link-check` exists to close exactly that gap and does
-  not yet close it — it exits 0 while emitting no ELF. See *Gates*.
-- **No test asserts that a binary came out.** There is no gate that reads an
-  artefact back, so a `linkAndroid` that silently stopped linking would still
-  leave `test`, `check` and `ndk-abi-check` green.
+- **The link gate was observed on one ABI only.** `arm64-v8a` at API 35 linked,
+  was installed, and passed the header check. `ndk-abi-check` *compiles* the
+  other four, which is a different claim from having watched each one link;
+  `-Dabi=<name> -Dapi=<n>` is what closes that, and no such run is recorded
+  here. Per-ABI coverage remains open for four of the five ABIs.
+- **`ndk-elf-check` reads the ELF header, not the link.** It confirms
+  `EI_CLASS`, `EI_DATA`, `EI_OSABI` and `e_machine` against the requested ABI,
+  so a host executable or a bionic binary for a different ABI is refused. It
+  does not parse the program headers or the dynamic section: that the artefact
+  links `libc.so` and `libm.so`, carries interpreter `/system/bin/linker64`, and
+  records the NDK revision is established by reading it with `file(1)`, which
+  no gate in this tree does.
+- **`EI_OSABI` does not separate bionic from glibc on its own.** NDK r29 stamps
+  `ELFOSABI_NONE` (0) on every `libc.so` for all five ABIs and every API level —
+  verified by reading them — so the checker accepts 0 or 97 and refuses
+  everything else, including glibc's GNU value. `e_machine` is what separates a
+  host artefact from an Android one.
+- **No test asserts a bionic *symbol* was resolved.** The link gate's generated
+  main calls `puts`, so a link that ignored it would fail, but nothing inspects
+  the dynamic section for `libc.so` or `libm.so`.
 - **Every NDK layout fact here was read from r29.** Not from a specification,
   not from another revision, and not from a device. `tools/sync-ndk.sh` is the
   thing that turns "read once" into "checked on demand".

@@ -127,8 +127,9 @@ Gates are owned by `build.zig` and documented in `README.md` §Gates.
   are never run. Needs no NDK.
 - **libc link — `zig build ndk-link-check`.** Establishes that Zig links a
   real bionic Android executable against a real sysroot. **Needs an NDK.**
-- **what CI runs — `zig build check`.** `test` plus `ndk-abi-check`. Needs no
-  NDK.
+- **local aggregate — `zig build check`.** `test` plus `ndk-abi-check`. Needs
+  no NDK. **CI does not run this step** (§8): the workflow runs those two
+  halves as two jobs, because one job per gate is one red gate per failure.
 - **everything — `zig build all`.** The above, plus `fmt-check` and the
   bionic link. Needs an NDK.
 
@@ -166,9 +167,19 @@ and `zig build fmt-check`, plus `tools/sync-ndk.sh` if the ABI table moved.
 - Comments say **why**. A comment that repeats the next line is deleted. A
   decision with a counterchoice somebody might re-litigate belongs in
   `CONTRACT.md` §3 or `CHANGELOG.md`, not in a trailing comment.
-- No hidden allocation. `Ndk` allocates nothing and frees nothing; the
-  path-building functions (`Ndk.libcDirFor`, `Ndk.apiLevelsFor`) take a
-  caller-supplied allocator and return a slice the caller frees.
+- No hidden allocation, and the asymmetry is the half to remember. Seven
+  public entry points take a caller-supplied allocator, and they do not agree
+  on who frees what. `Ndk.libcDirFor` and `Ndk.apiLevelsFor` return a slice
+  the caller frees. `Ndk.probeCandidates` returns a `Probes` that the caller
+  MUST release with `Probes.deinit`. `Ndk.find` and `Ndk.open` return an `Ndk`
+  whose slices come from that same allocator and are nobody's to free.
+  `Ndk.describeProbeFailure` builds and frees its own `Probes` and returns
+  `void`. `Ndk.readVersion` returns a `Version`, a value type that owns
+  nothing. An `Ndk` value itself allocates nothing and has deliberately no
+  `deinit`. Two values here DO own their paths and MUST be released:
+  `Ndk.Probes`, which exists only to be freed on a discovery failure, and
+  `LibcPaths`, whose `deinit` frees exactly the three paths `forAndroid`
+  copied. **No `deinit` means "owns nothing", never "nothing to free."**
 - Match the code that is there. `src/` has one house style; do not introduce a
   second one inside one file.
 
@@ -202,30 +213,50 @@ One of the two items it owed is discharged. The other is not.
 - **Item 8, the licence gate — discharged.** The `licence` job requires a
   non-empty `LICENSE`, hard-rejects GPL/LGPL/AGPL by abbreviation *and* by
   spelled-out title, rejects `NOASSERTION`, then requires at least one
-  allowlisted licence name. This package ships MIT, so the gate is green, and
-  a relicensing pull request now fails in CI rather than in nobody's review.
+  allowlisted licence name. This package ships MIT, so the gate is written to
+  pass — the licence it will pass on is a prediction, not a run (see the last
+  bullet). What the job removes is the review blind spot: a relicensing pull
+  request stops depending on somebody reading the diff.
 - **Item 5, cross-compilation — partly discharged.** Gated today:
   `x86_64-linux`, the `fmt`/`test`/`licence` jobs' own runner, natively; and
-  the five Android ABIs, one `cross` matrix leg each, through
-  `ndk-abi-check`, which resolves a target query and compiles the package for
-  it but never runs it. The `link` job adds the claim no other job makes: that
-  Zig links a real bionic executable against a real sysroot.
+  the five Android ABIs, by the `cross` job. That job is one command, not a
+  matrix: `ndk-abi-check` takes no ABI selector, loops its own five-entry
+  table internally and hangs five compile steps off the single step, so a
+  green `cross` is the claim for all five at once. It resolves a target query
+  per ABI and compiles; it never runs the binaries and never reads a sysroot.
+  The `link` job adds the claim no other job makes: that Zig links a real
+  bionic executable against a real sysroot.
 - **The gap, named.** The house contract's Tier-2 host triples
   `aarch64-linux`, `aarch64-macos`, `x86_64-windows` and `wasm32-wasi` are
-  not gated as *host* targets, and `riscv64-linux` is not either: the
-  `riscv64` `cross` leg is an Android ABI, a different OS, which `ci.yml`'s
-  own header says. Closing that needs a compile-only cross step in `build.zig`
-  for a non-Android host triple, and no such step exists. `zig build` exposes
-  `install`, `uninstall`, `fmt`, `fmt-check`, `test`, `ndk-abi-check`,
-  `ndk-link-check`, `check` and `all`, and the only target any of them takes
-  is `-Dtarget`, which selects the target the *tests* compile for, not a host
-  cross gate. The nearest thing that exists is the `test` step degrading to
-  compile-only under a foreign `-Dtarget`; it is wired to no job and has never
-  run green for any of those triples. Do not give it a step name in a commit
-  message: there is none to give.
+  not gated as *host* targets, and `riscv64-linux` is not either: what covers
+  riscv64 is an entry of `ndk-abi-check`'s table, an Android ABI, a different
+  OS, which `ci.yml`'s own header says. Closing the gap needs a compile-only
+  cross step in `build.zig` for a non-Android host triple, and no such step
+  exists. `zig build` exposes `install`, `uninstall`, `fmt`, `fmt-check`,
+  `test`, `ndk-abi-check`, `ndk-link-check`, `check` and `all`, and the only
+  target any of them takes is `-Dtarget`, which selects the target the *tests*
+  compile for, not a host cross gate. The nearest thing that exists is the
+  `test` step degrading to compile-only under a foreign `-Dtarget`; it is
+  wired to no job and has never run green for any of those triples. Do not
+  give it a step name in a commit message: there is none to give.
+- **The second gap, per-ABI observation.** `cross` compiles all five ABIs in
+  one job, so a failure there names a job and not an ABI. And `link` runs
+  `ndk-link-check` with neither `-Dabi` nor `-Dapi`, so it links only the
+  defaults — `arm64-v8a` at API 35 — and the other four ABIs are never linked
+  by anything CI runs. The capability exists, because `ndk-link-check` takes
+  `-Dabi=` (§5), but nothing in the workflow varies it. Do not read the
+  `cross` job's coverage as link coverage: compiling for an ABI and linking
+  against its sysroot paths are the two claims this package keeps apart
+  everywhere else.
 - **CI runs the two halves of `check` separately**, never `zig build check`
   itself — `zig build fmt-check` is the `fmt` job, `zig build test` the `test`
   job, `zig build ndk-abi-check` the `cross` job. Four of the five jobs
-  provision no NDK and assert nothing about one, so their green runs are the
-  evidence that the sysroot stays optional and that a red CI is not a broken
-  package. Only `link` fetches the NDK.
+  provision no NDK and assert nothing about one; only `link` fetches it.
+- **Those jobs are configured, not observed.** This repository has never been
+  pushed through the workflow, so no CI run stands behind any claim about one.
+  Write "CI runs `X`", never "CI is green". What *is* observed is local: on
+  this host `zig build test` passes with no NDK installed and no
+  `ANDROID_NDK_*` set, which is the property the `fmt`, `test` and `cross` jobs
+  are wired to exercise. `ndk-abi-check` and `ndk-link-check` need an
+  observation of their own before this package may say more about them than
+  their mechanism.
