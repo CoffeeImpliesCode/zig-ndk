@@ -179,8 +179,17 @@ pub fn render(self: LibcPaths, out: *std.Io.Writer) std.Io.Writer.Error!void {
 const testing = std.testing;
 
 /// Renders an Android file into a freshly allocated buffer. Test helper.
-fn renderAlloc(gpa: Allocator, include_dir: []const u8, crt_dir: []const u8) ![]u8 {
-    var paths = try LibcPaths.forAndroid(gpa, include_dir, include_dir, crt_dir);
+///
+/// The two include directories are separate parameters because an Android file
+/// passes the same one twice, and a helper that hard-wired `include_dir` into
+/// both keys could not tell a renderer that swapped them from one that did not.
+fn renderAlloc(
+    gpa: Allocator,
+    include_dir: []const u8,
+    sys_include_dir: []const u8,
+    crt_dir: []const u8,
+) ![]u8 {
+    var paths = try LibcPaths.forAndroid(gpa, include_dir, sys_include_dir, crt_dir);
     defer paths.deinit(gpa);
 
     var buffer: std.Io.Writer.Allocating = .init(gpa);
@@ -284,10 +293,19 @@ test "deinit frees what forAndroid copied and never the three borrowed fields" {
     paths.deinit(testing.allocator);
 }
 
-test "render writes all six keys, empty for the three Android omits" {
+test "render writes all six keys, each carrying the value it was given" {
+    // Two DIFFERENT directories for the two include keys. Android itself passes
+    // the same directory twice, which is why a renderer that wrote
+    // `sys_include_dir` under `include_dir` and the reverse would be
+    // indistinguishable from one that did not: the values are equal wherever
+    // the caller made them equal. A type that permits two distinct directories
+    // has to be exercised with two, or the swap is free.
+    const include = "/ndk/sysroot/usr/include";
+    const sys_include = "/ndk/sysroot/usr/include/android";
     const text = try renderAlloc(
         testing.allocator,
-        "/ndk/sysroot/usr/include",
+        include,
+        sys_include,
         "/ndk/sysroot/usr/lib/aarch64-linux-android/35",
     );
     defer testing.allocator.free(text);
@@ -313,23 +331,28 @@ test "render writes all six keys, empty for the three Android omits" {
         try testing.expect(std.mem.indexOf(u8, text, needle) != null);
     }
 
-    // The three platform-specific keys are present with an empty value.
-    try testing.expect(std.mem.indexOf(u8, text, "\nmsvc_lib_dir=\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\nkernel32_lib_dir=\n") != null);
-    try testing.expect(std.mem.endsWith(u8, text, "\ngcc_dir=\n"));
-
-    // The three Android keys carry their values.
-    try testing.expect(std.mem.indexOf(u8, text, "\ninclude_dir=/ndk/sysroot/usr/include\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\nsys_include_dir=/ndk/sysroot/usr/include\n") != null);
+    // The three Android keys carry their values, and the two include keys
+    // carry theirs in the order they were passed rather than in whatever order
+    // the two fields happen to be declared. The needles end in a newline, so
+    // neither can be satisfied by the other key's line.
+    try testing.expect(
+        std.mem.indexOf(u8, text, "\ninclude_dir=/ndk/sysroot/usr/include\n") != null,
+    );
+    try testing.expect(
+        std.mem.indexOf(u8, text, "\nsys_include_dir=/ndk/sysroot/usr/include/android\n") != null,
+    );
     try testing.expect(
         std.mem.indexOf(u8, text, "\ncrt_dir=/ndk/sysroot/usr/lib/aarch64-linux-android/35\n") != null,
     );
 }
 
 test "render is byte-for-byte the layout Zig itself writes" {
+    // Distinct values again, so the comparison pins the order of the two
+    // include keys as well as the bytes around them.
     const text = try renderAlloc(
         testing.allocator,
         "/inc",
+        "/sys-inc",
         "/crt",
     );
     defer testing.allocator.free(text);
@@ -342,7 +365,7 @@ test "render is byte-for-byte the layout Zig itself writes" {
         \\# The system-specific include directory. May be the same as `include_dir`.
         \\# On Windows it's the directory that includes `vcruntime.h`.
         \\# On POSIX it's the directory that includes `sys/errno.h`.
-        \\sys_include_dir=/inc
+        \\sys_include_dir=/sys-inc
         \\
         \\# The directory that contains `crt1.o` or `crt2.o`.
         \\# On POSIX, can be found with `cc -print-file-name=crt1.o`.
@@ -367,9 +390,10 @@ test "render is byte-for-byte the layout Zig itself writes" {
 
 test "render output is accepted by the parser that will read it" {
     const include = "/ndk/sysroot/usr/include";
+    const sys_include = "/ndk/sysroot/usr/include/android";
     const crt = "/ndk/sysroot/usr/lib/aarch64-linux-android/35";
 
-    const text = try renderAlloc(testing.allocator, include, crt);
+    const text = try renderAlloc(testing.allocator, include, sys_include, crt);
     defer testing.allocator.free(text);
 
     const target = try androidTarget();
@@ -379,8 +403,10 @@ test "render output is accepted by the parser that will read it" {
     defer arena.deinit();
     const parsed = try parseRendered(arena.allocator(), text, &target);
 
+    // Through the parser, which is where a swapped pair becomes a build that
+    // cannot find `stdlib.h`: the two values are distinct all the way here.
     try testing.expectEqualStrings(include, parsed.include_dir.?);
-    try testing.expectEqualStrings(include, parsed.sys_include_dir.?);
+    try testing.expectEqualStrings(sys_include, parsed.sys_include_dir.?);
     try testing.expectEqualStrings(crt, parsed.crt_dir.?);
 
     // parse maps an empty value to null; the file still carries the key.

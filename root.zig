@@ -64,7 +64,7 @@ const std = @import("std");
 // surface no reader can review in this file; the flat index `lib/std/std.zig`
 // keeps at this compiler line is the precedent.
 
-/// The five Android NDK ABI directory names, as shipped in the NDK's own
+/// The five Android NDK ABI names, as shipped in the NDK's own
 /// `meta/abis.json`. Owned by nothing; every method is a pure function of the
 /// tag.
 pub const Abi = @import("src/ndk.zig").Abi;

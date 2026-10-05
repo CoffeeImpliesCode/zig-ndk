@@ -8,7 +8,7 @@ the rules with their reasons and cites paths instead of restating them.
 ## 1. What this package is, and what it is not
 
 - **It is** discovery of an unpacked NDK (`Ndk.find`, `Ndk.open`) plus a
-  description of its sysroot: the five ABI directories, their sysroot triples,
+  description of its sysroot: the five ABI names, their sysroot triples,
   the API-level library directories, and the six-field libc paths file
   `std.zig.LibCInstallation.parse` demands. That is the whole product. One
   paragraph of why it exists: `README.md` §The problem.
@@ -123,13 +123,29 @@ Gates are owned by `build.zig` and documented in `README.md` §Gates.
   all on the host target. Two `b.addTest` roots hang off this one step: the
   unit tests in `src/`, reached through `root.zig`, and
   `test/integration_test.zig`, reached through the published `ndk` module
-  under the name a dependent imports it by. Needs no NDK.
+  under the name a dependent imports it by. Counted on 2026-10-05 that is 53
+  test blocks — 35 unit (29 in `src/ndk.zig`, 5 in `src/libc_file.zig`, 1 in
+  `root.zig`) and 18 in the integration file — but a count written in a
+  document is the one number here that rots; `zig build test` prints the real
+  one. Needs no NDK.
 - **cross compile — `zig build ndk-abi-check`.** Establishes that every ABI's
   `std.Target.Query` resolves and the package compiles for it. The binaries
   are never run. Needs no NDK.
 - **libc link — `zig build ndk-link-check`.** Establishes that Zig links a
-  real bionic Android executable against a real sysroot, and that the
-  installed artefact is an ELF for the requested ABI. **Needs an NDK.**
+  real bionic Android executable against a real sysroot, and then reads the
+  installed artefact back and checks four things about it: `EI_CLASS`,
+  `e_machine`, `PT_INTERP` and `DT_NEEDED`. A green compile is not a proof, so
+  the readback is the proof. **Needs an NDK.** The artefact is installed as
+  `zig-out/bin/ndk-link-check-<abi>-api<level>` — one file per cell, so five
+  ABI runs no longer overwrite each other and the directory is the record of
+  what was linked. `PT_INTERP` and `DT_NEEDED` are not decoration: on x86_64,
+  this gate's own CI architecture, a host glibc PIE and a bionic Android
+  binary agree on `e_machine`, `EI_CLASS`, `EI_DATA` and `ELFOSABI_NONE`, and
+  `e_machine` alone cannot tell them apart. `PT_INTERP` must name
+  `/system/bin/linker` or `/system/bin/linker64` by class, and `DT_NEEDED`
+  must name `libc.so` where glibc names `libc.so.6`. Do not "simplify" the
+  readback to a header check; a header check is what this gate already had,
+  and it was green on a host binary.
 - **pin check — `zig build sync-ndk`.** Establishes that the release
   identity, the archive hash and the copied ABI table still describe the NDK
   in front of it (§4). **Needs an NDK**: finding none, the step depends on a
@@ -259,13 +275,15 @@ One of the two items it owed is discharged. The other is not.
   riscv64 is an entry of `ndk-abi-check`'s table, an Android ABI, a different
   OS, which `ci.yml`'s own header says. Closing the gap needs a compile-only
   cross step in `build.zig` for a non-Android host triple, and no such step
-  exists. `zig build` exposes `install`, `uninstall`, `fmt`, `fmt-check`,
-  `test`, `ndk-abi-check`, `ndk-link-check`, `check` and `all`, and the only
-  target any of them takes is `-Dtarget`, which selects the target the *tests*
-  compile for, not a host cross gate. The nearest thing that exists is the
-  `test` step degrading to compile-only under a foreign `-Dtarget`; it is
-  wired to no job and has never run green for any of those triples. Do not
-  give it a step name in a commit message: there is none to give.
+  exists. `zig build` exposes, in build.zig's declaration order, `install`,
+  `uninstall`, `test`, `ndk-abi-check`, `ndk-link-check`, `sync-ndk`, `fmt`,
+  `fmt-check`, `check` and `all` — only `ndk-link-check` and `sync-ndk` want an
+  NDK — and the only target any of them takes is `-Dtarget`, which selects the
+  target the *tests* compile for, not a host cross gate. The nearest thing
+  that exists is the `test` step degrading to compile-only under a foreign
+  `-Dtarget`; it is wired to no job and has never run green for any of those
+  triples. Do not give it a step name in a commit message: there is none to
+  give.
 - **The second gap, per-ABI observation.** `cross` compiles all five ABIs in
   one job, so a failure there names a job and not an ABI. And `link` runs
   `ndk-link-check` with neither `-Dabi` nor `-Dapi`, so it links only the
@@ -286,7 +304,9 @@ One of the two items it owed is discharged. The other is not.
 - **Every gate has been observed locally; CI itself never has.** This is the
   distinction worth keeping and the easy one to get backwards. Observed on
   this host on 2026-10-05 against NDK r29: every row of `README.md` §Gates
-  exits 0, and the link gate installs `zig-out/bin/ndk-link-check`, which
+  exits 0, and the link gate installs
+  `zig-out/bin/ndk-link-check-<abi>-api<level>` —
+  `ndk-link-check-arm64-v8a-api35` for the default cell — which
   `file(1)` reads as an aarch64 Android PIE with interpreter
   `/system/bin/linker64`, built by NDK r29. The bionic link is established,
   not predicted. That table is the record: re-read it rather than re-deriving

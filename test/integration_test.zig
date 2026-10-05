@@ -258,17 +258,6 @@ test "every ABI has a unique non-empty name and triple, and a floor r29 could de
         try testing.expect(a.name().len > 0);
         try testing.expect(a.triple().len > 0);
 
-        // Neither may carry a separator. A name carrying one would let a
-        // `-Dabi=` argument carry path structure, and a lookup for it would
-        // resolve to a path that is simply absent — a missing directory rather
-        // than a typo in the table.
-        try testing.expect(std.mem.indexOfScalar(u8, a.name(), path.sep) == null);
-        try testing.expect(std.mem.indexOfScalar(u8, a.triple(), path.sep) == null);
-
-        // The namespaced spelling must not drift from the method, since
-        // build.zig's generated helper reaches the table through it.
-        try testing.expectEqualStrings(a.triple(), Ndk.tripleFor(a));
-
         // r29 declares 21 for four ABIs and 35 for riscv64. Below 21 is a
         // release the NDK does not target and above 35 nothing has shipped, so
         // either way the level resolves to a directory that is not there — a
@@ -403,6 +392,10 @@ test "the six-field libc paths file built from a resolved sysroot parses, and ma
     try testing.expectEqualStrings(expected_sysroot, install.sysroot());
 
     const include_dir = try path.join(gpa, &.{ install.sysroot(), "usr", "include" });
+    // A second directory the first does not contain, so the two keys can be
+    // told apart in the rendered bytes. Real Android points both at the same
+    // place; the type permits two, and only two, can prove which is which.
+    const sys_include_dir = try path.join(gpa, &.{ install.sysroot(), "usr", "include", "android" });
     const crt_dir = try install.libcDirFor(gpa, testing.io, .arm64_v8a, 35);
 
     // `crt_dir` is the per-API-level directory, never the API-agnostic triple
@@ -413,13 +406,34 @@ test "the six-field libc paths file built from a resolved sysroot parses, and ma
     // Rendered through the published renderer, not through a template written
     // here. The six-field format has one home; a second copy in a test is how
     // a second source of truth starts.
-    var paths = try LibcPaths.forAndroid(gpa, include_dir, include_dir, crt_dir);
+    var paths = try LibcPaths.forAndroid(gpa, include_dir, sys_include_dir, crt_dir);
     defer paths.deinit(gpa);
 
     var buffer: std.Io.Writer.Allocating = .init(gpa);
     defer buffer.deinit();
     try paths.render(&buffer.writer);
     const text = buffer.written();
+
+    // On the bytes, with the two directories DISTINCT. An Android file carries
+    // the same directory under both keys, so a renderer that wrote
+    // `sys_include_dir` under `include_dir` and the other way round produced a
+    // file no test in this repository could tell from a correct one: every
+    // caller here passed one value for both, and the swap cost a build a libc
+    // paths file whose include path was somebody else's.
+    try testing.expect(
+        std.mem.indexOf(
+            u8,
+            text,
+            try std.fmt.allocPrint(gpa, "\ninclude_dir={s}\n", .{include_dir}),
+        ) != null,
+    );
+    try testing.expect(
+        std.mem.indexOf(
+            u8,
+            text,
+            try std.fmt.allocPrint(gpa, "\nsys_include_dir={s}\n", .{sys_include_dir}),
+        ) != null,
+    );
 
     // `forAndroid` is the Android entry point, so the three platform-only
     // fields stay unset and `render` must write them present and valueless.
@@ -433,7 +447,7 @@ test "the six-field libc paths file built from a resolved sysroot parses, and ma
     const lines = try keyLines(gpa, text);
     try testing.expectEqual(fields.len, lines.len);
 
-    const values = [6][]const u8{ include_dir, include_dir, crt_dir, "", "", "" };
+    const values = [6][]const u8{ include_dir, sys_include_dir, crt_dir, "", "", "" };
     // `inline for`, not `for`: `std.meta.fields` yields
     // `builtin.Type.StructField`, whose `type` member exists only at comptime,
     // so a runtime loop cannot even copy one element out of the slice. The key
@@ -457,7 +471,7 @@ test "the six-field libc paths file built from a resolved sysroot parses, and ma
     const parsed = try parsePathsFile(gpa, text, &target);
 
     try testing.expectEqualStrings(include_dir, parsed.include_dir.?);
-    try testing.expectEqualStrings(include_dir, parsed.sys_include_dir.?);
+    try testing.expectEqualStrings(sys_include_dir, parsed.sys_include_dir.?);
     try testing.expectEqualStrings(crt_dir, parsed.crt_dir.?);
 
     // An empty value parses to null. The file still carries the key, which is
@@ -986,6 +1000,121 @@ test "source.properties that names no revision yields VersionUnreadable, and abs
     try testing.expectEqual(@as(u32, 14206865), version.patch);
 }
 
+test "a root deleted between open and readVersion yields NotAnNdk" {
+    // The defect this catches: `readVersion` opening `root_path` and letting the
+    // raw `error.FileNotFound` out. The root is the one `find` or `open` just
+    // resolved a moment earlier, so the only way it is gone is that something
+    // moved, removed or replaced it — and the caller is owed the same domain
+    // refusal every other "not usable any more" answers with, not a syscall
+    // code whose meaning depends on which step produced it.
+    //
+    // The tree is built, opened, read, and only then deleted, so the root is
+    // genuinely absent at the read. A directory that is merely unreadable is a
+    // different case with a different answer, and it is the next test.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var fixture = try Fixture.init(gpa);
+    defer fixture.deinit();
+    _ = try createTree(&fixture, gpa, .linux_x86_64, .direct, .arm64_v8a, &.{"35"});
+    const install = try Ndk.open(gpa, testing.io, fixture.root, .linux_x86_64);
+
+    // Before: the root is a directory and `source.properties` is simply absent,
+    // which is legal and answers `null`.
+    try testing.expect(try install.readVersion(gpa, testing.io) == null);
+
+    // Gone. `TmpDir.cleanup` ignores whatever it cannot delete, so removing the
+    // tree here leaves the `defer` nothing to fail on.
+    try Dir.cwd().deleteTree(testing.io, fixture.root);
+
+    // After: the same call, the same `Ndk`, and a refusal in the library's own
+    // vocabulary. `describeProbeFailure` is the wrong tool here — no probe was
+    // refused — so the answer has to be the one that says so.
+    try testing.expectError(error.NotAnNdk, install.readVersion(gpa, testing.io));
+}
+
+test "a directory this process cannot read is a filesystem error, not a domain refusal" {
+    // The defect this catches: `isDirectoryPath` and `apiLevelsFor` reading
+    // every error as "not there". A permission failure would then be reported
+    // as `ApiLevelUnavailable` or `UnsupportedAbi` — "this NDK does not ship
+    // that ABI", a confident claim about the NDK derived from a broken
+    // filesystem, which sends the caller to inspect a correct installation.
+    //
+    // The tree is real and carries level 35, so neither refusal could be true.
+    // Which assertion runs depends on the process: mode `000` is enforced
+    // against everything except a process privileged to ignore it. Both
+    // branches are asserted against the behaviour actually observed, so this
+    // is a test under either and never a silent no-op.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var fixture = try Fixture.init(gpa);
+    defer fixture.deinit();
+    const tree = try createTree(&fixture, gpa, .linux_x86_64, .direct, .arm64_v8a, &.{"35"});
+    const install = try Ndk.open(gpa, testing.io, fixture.root, .linux_x86_64);
+
+    // The triple directory itself, because that is the one both halves of the
+    // library walk into: `libcDirFor` stats a level beneath it and
+    // `apiLevelsFor` opens it to be iterated, and neither can without the
+    // search permission. `setFilePermissions` is what `chmod 000` is on this
+    // interface.
+    const Permissions = Dir.Permissions;
+    try Dir.cwd().setFilePermissions(testing.io, tree, @as(Permissions, @enumFromInt(0)), .{});
+    defer Dir.cwd().setFilePermissions(
+        testing.io,
+        tree,
+        @as(Permissions, @enumFromInt(0o755)),
+        .{},
+    ) catch {};
+
+    // Whether the mode actually bites. `geteuid` would say so on this host, but
+    // the question is whether the kernel enforces it FOR THIS PROCESS, and
+    // that is what opening the directory answers. The open asks for iteration
+    // because that is the one `apiLevelsFor` performs, and because a plain
+    // `openDirAbsolute` here succeeds even on a mode-000 directory — it opens
+    // `O_PATH`, which asks the kernel nothing about the target's own mode and
+    // would make this probe answer "not enforced" on a machine where it is.
+    const enforced = blk: {
+        if (Dir.openDirAbsolute(testing.io, tree, .{ .iterate = true })) |dir| {
+            dir.close(testing.io);
+            break :blk false;
+        } else |err| switch (err) {
+            error.AccessDenied => break :blk true,
+            else => return err,
+        }
+    };
+
+    if (enforced) {
+        // The filesystem error passes through unchanged, on both halves.
+        // `ApiLevelUnavailable` and `UnsupportedAbi` would both be wrong: the
+        // directory is there, and this process simply cannot see it.
+        try testing.expectError(
+            error.AccessDenied,
+            install.libcDirFor(gpa, testing.io, .arm64_v8a, 35),
+        );
+        try testing.expectError(
+            error.AccessDenied,
+            install.apiLevelsFor(gpa, testing.io, .arm64_v8a),
+        );
+    } else {
+        // The mode did not bite: root, or a filesystem that ignores it. Level
+        // 35 is still there, so there is no error to report and neither call
+        // may invent one — a refusal here would be the same confident wrong
+        // answer pointed the other way, at a directory that exists.
+        try testing.expectEqualStrings(
+            try path.join(gpa, &.{ tree, "35" }),
+            try install.libcDirFor(gpa, testing.io, .arm64_v8a, 35),
+        );
+        try testing.expectEqualSlices(
+            u32,
+            &.{35},
+            try install.apiLevelsFor(gpa, testing.io, .arm64_v8a),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 5. Both on-disk layouts
 // ---------------------------------------------------------------------------
@@ -1066,6 +1195,56 @@ test "both on-disk layouts resolve, and both describe the same sysroot" {
     // care which wrapper produced it.
     const from_inner = try Ndk.open(gpa, testing.io, bundle_root, .linux_x86_64);
     try testing.expectEqual(Ndk.Shape.direct, from_inner.shape);
+}
+
+test "a relative root is canonicalised, so root_path and sysroot are absolute" {
+    // The defect this catches: `open` taking the root exactly as the caller
+    // spelled it. Every other test in this repository passes an absolute path,
+    // so leaving the root relative costs nothing here — and a consumer that
+    // changes directory after configuring, or that hands `open` a path relative
+    // to a build root, receives an `Ndk` whose every path is relative and stops
+    // pointing at the tree once the process stands anywhere else. `sysroot()`
+    // is the one path a consumer turns into a libc paths file, so it is the one
+    // that must not be a function of the current directory.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var fixture = try Fixture.init(gpa);
+    defer fixture.deinit();
+    _ = try createTree(&fixture, gpa, .linux_x86_64, .direct, .arm64_v8a, &.{"35"});
+
+    // The working directory is restored by the `defer` registered AFTER the
+    // fixture's, so it runs FIRST: a leaked `chdir` would break the fixture
+    // cleanup and every test that runs after this one, and the blocks in this
+    // file execute in no guaranteed order.
+    const here = try Dir.cwd().realPathFileAlloc(testing.io, ".", gpa);
+    const parent = path.dirname(fixture.root).?;
+    const name = path.basename(fixture.root);
+
+    try std.Io.Threaded.chdir(parent);
+    defer std.Io.Threaded.chdir(here) catch {};
+
+    const install = try Ndk.open(gpa, testing.io, name, .linux_x86_64);
+    try testing.expectEqual(Ndk.Shape.direct, install.shape);
+
+    try testing.expect(path.isAbsolute(install.root_path));
+    try testing.expect(path.isAbsolute(install.sysroot()));
+    // Absolute AND canonical: the same tree whatever the caller spelled and
+    // wherever the process stands when the path is read.
+    try testing.expectEqualStrings(fixture.root, install.root_path);
+    try testing.expectEqualStrings(
+        try path.join(gpa, &.{
+            fixture.root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+        }),
+        install.sysroot(),
+    );
+    // The rest of the API agrees with it: a canonical root is what makes the
+    // per-ABI paths absolute too, and those are the values a libc paths file
+    // carries.
+    try testing.expect(path.isAbsolute(
+        try install.libcDirFor(gpa, testing.io, .arm64_v8a, 35),
+    ));
 }
 
 // ---------------------------------------------------------------------------

@@ -62,13 +62,17 @@
 # which records every fact in this file as something an NDK bump has to revisit.
 #
 # One further fact is deliberately NOT here, because it can vanish: the per-ABI
-# `min_os_version` in meta/abis.json. Google has deleted the key -- the current
-# meta/abis.json ends every ABI object at `llvm_triple` -- so the script probes
-# for it and, when it is absent, says "the per-ABI floor is NOT cross-checked"
-# and carries on. That is neither agreement nor disagreement, and a script that
+# `min_os_version` in meta/abis.json. It is PRESENT in the pinned r29 -- all five
+# ABI objects end with it, carrying 21/21/35/21/21 -- so the floor IS compared
+# against the real NDK on every run. The script still probes for it rather than
+# assuming it, because the key is not guaranteed to survive: Google's
+# googlesource mirror of the NDK's main branch already has ABI objects ending at
+# `llvm_triple`, and that mirror moves independently of any release. So when the
+# key is absent the script says "the per-ABI floor is NOT cross-checked" and
+# carries on -- that is neither agreement nor disagreement, and a script that
 # treated an absent key as `null` would report all five floors as changed on an
 # NDK that changed nothing else. Abi.minApiLevel in src/ndk.zig is a locally
-# held copy of that floor, which is why it survives the key's removal.
+# held copy of that floor, which is why it survives the key's absence.
 
 release = r29
 revision = 29.0.14206865

@@ -1336,11 +1336,6 @@ test "every triple matches r29's meta/abis.json" {
     try testing.expectEqualStrings("riscv64-linux-android", Abi.riscv64.triple());
     try testing.expectEqualStrings("i686-linux-android", Abi.x86.triple());
     try testing.expectEqualStrings("x86_64-linux-android", Abi.x86_64.triple());
-
-    // Ndk.tripleFor is the namespaced spelling and must not drift.
-    for (std.enums.values(Abi)) |abi| {
-        try testing.expectEqualStrings(abi.triple(), Ndk.tripleFor(abi));
-    }
 }
 
 test "every minimum API level matches r29's min_os_version" {
@@ -2190,12 +2185,25 @@ test "a discovery refusal names every source and the value it read" {
         );
     }
 
-    // Set, empty and set again: three renderings, and the two values are the
-    // caller's own strings rather than copies of them.
+    // Set, empty, padded and set again: four values, and they are the caller's
+    // own strings rather than copies of them.
     {
+        var scratch = testing.tmpDir(.{});
+        defer scratch.cleanup();
+        const padded_root = try absPathOf(gpa, &scratch);
+
         var environ: Environ.Map = .init(testing.allocator);
         defer environ.deinit();
-        try environ.put("ANDROID_NDK_HOME", "/opt/ndk/r29");
+        // A root that IS on disk, spelled the way a CI YAML block scalar, a
+        // `$(cat ndk.path)` and a tab-indented Makefile value all spell it:
+        // padded on both sides. What the refusal prints is the path discovery
+        // would have probed, so the padding cannot survive into the report — a
+        // report naming '  /path  ' is naming a path no probe ever looked at,
+        // and the reader who types it back gets a directory that is not there.
+        try environ.put(
+            "ANDROID_NDK_HOME",
+            try std.fmt.allocPrint(gpa, "  {s}\t\n ", .{padded_root}),
+        );
         try environ.put("ANDROID_NDK_ROOT", "");
         try environ.put("ANDROID_NDK", "~/ndk");
 
@@ -2205,12 +2213,34 @@ test "a discovery refusal names every source and the value it read" {
         const message = out.written();
 
         try testing.expect(std.mem.indexOf(u8, message, "/opt/ndk/explicit") != null);
-        try testing.expect(std.mem.indexOf(u8, message, "/opt/ndk/r29") != null);
         try testing.expect(std.mem.indexOf(u8, message, "~/ndk") != null);
         // The empty one reads `(empty)` and not `(unset)`: a reader shown
         // `(unset)` would go looking for a variable that was exported.
         try testing.expect(std.mem.indexOf(u8, message, "'(empty)'") != null);
         try testing.expectEqual(@as(usize, 0), countOf(message, "(unset)"));
+
+        // Trimmed, inside the quotes and on both sides of them. The value is
+        // quoted, so the assertion is about the bytes between the quotes and
+        // not about a substring the surrounding prose could satisfy.
+        try testing.expect(
+            std.mem.indexOf(
+                u8,
+                message,
+                try std.fmt.allocPrint(gpa, "'{s}'", .{padded_root}),
+            ) != null,
+        );
+        try testing.expect(
+            std.mem.indexOf(
+                u8,
+                message,
+                try std.fmt.allocPrint(gpa, "'  {s}", .{padded_root}),
+            ) == null,
+        );
+        // And no escape for the tab or the newline the padding carried: those
+        // bytes were the shell's, not the path's, so the report must not carry
+        // them into a value the reader is meant to type back.
+        try testing.expect(std.mem.indexOf(u8, message, "\\x09") == null);
+        try testing.expect(std.mem.indexOf(u8, message, "\\x0a") == null);
     }
 }
 
@@ -2397,6 +2427,39 @@ test "a refusal stays one line whatever the candidate carries" {
     // exported is not the value that was probed.
     try testing.expect(std.mem.indexOf(u8, noisy, "android\\x0andk\\x09r29") != null);
     try testing.expect(std.mem.indexOf(u8, clean, "\\x0a") == null);
+
+    // A candidate whose newline TRAILING is a different case from one whose
+    // newline is in the middle. The interior one is a real directory name, so
+    // it stays and the refusal shows it escaped; trailing padding is trimmed
+    // before the probe, so the paths the refusal reports are the paths the
+    // probe used, spelled clean. Delete that trim and the probe falls back to
+    // the candidate as written, every reported sysroot ends in `\x0a`, and the
+    // report names two directories that were never probed.
+    const padded = try probeMessage(
+        try std.fmt.allocPrint(gpa, "{s}\n", .{root}),
+        .linux_x86_64,
+    );
+    defer testing.allocator.free(padded);
+
+    // The sysroot paths are the canonical ones, byte for byte.
+    const canonical_sysroot = try path.join(gpa, &.{
+        root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+    });
+    try testing.expect(std.mem.indexOf(u8, padded, canonical_sysroot) != null);
+
+    // And the section that lists them carries no escape at all. The header
+    // names the candidate as the CALLER wrote it, escaped on purpose, so the
+    // assertion is scoped to the probe paths below that header rather than to
+    // the whole message — an escape in the header is the contract and an
+    // escape down here is the defect.
+    const header = "that is a directory:\n";
+    const probed_at = std.mem.indexOf(u8, padded, header).?;
+    const probed = padded[probed_at + header.len ..];
+    try testing.expect(std.mem.indexOf(u8, probed, "\\x0a") == null);
+    try testing.expect(std.mem.indexOf(u8, probed, "\\x09") == null);
+    // Same number of lines as the root with nothing to escape: the trailing
+    // newline neither ended a line nor left an escape behind.
+    try testing.expectEqual(countOf(clean, "\n"), countOf(padded, "\n"));
 
     // The discovery refusal has the same hazard in it: a variable carries a
     // newline as easily as a path does.

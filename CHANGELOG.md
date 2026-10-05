@@ -331,18 +331,41 @@ because each looks plausible and neither survives a check:
   reaches the library list.
 
 The fix was on the build-script side, not the link side. `b.addInstallArtifact`
-allocates the field, and a generated `ndk-elf-check` program then opens the
-installed file and reads its ELF header: the magic, then `EI_CLASS`,
-`EI_DATA`, `EI_OSABI` and `e_machine`, each against the ABI the gate was asked
-to build. `\x7fELF` opens every ELF on every OS and architecture, so the magic
-alone cannot tell a bionic `arm64-v8a` binary from a host executable or from
-bionic for a different ABI; `e_machine` is what separates them, and `EI_CLASS`
-catches `-Dabi=armeabi-v7a` resolving to a 64-bit artefact. The expectations
-are passed as `--abi --class --machine` rather than compiled in, so the checker
-carries no ABI table of its own to drift from `build.zig`'s. That run step
-carries `has_side_effects = true`, so a cached second build does not skip the
-check. Negative cases were exercised: pointed at a text file it fails on the
-magic, and with the file absent it fails on `ArtefactUnreadable`.
+allocates the field, and a generated `ndk-elf-check` program then reads the
+installed file whole: the magic and `EI_CLASS`, `EI_DATA`, `EI_OSABI` and
+`e_machine` from the header, then `PT_INTERP` and a `DT_NEEDED` naming exactly
+`libc.so`. `\x7fELF` opens every ELF on every OS and architecture, so the magic
+alone tells you nothing. `EI_CLASS` and `e_machine` separate one ABI from
+another. **Neither separates a host artefact from an Android one on x86_64**,
+which is the ABI this project's own CI host runs: a glibc PIE and a bionic
+Android x86_64 binary agree on `e_machine` 62, `EI_CLASS` 2, `EI_DATA` 1 and
+`ELFOSABI_NONE`. A header-only gate was therefore blind on exactly one ABI, and
+`PT_INTERP` and `DT_NEEDED` are what close it — glibc's interpreter is under the
+glibc store path and its libc soname is `libc.so.6`, where bionic's is
+`/system/bin/linker{,64}` and `libc.so`.
+
+The header expectations are passed as `--abi --class --machine` rather than
+compiled in, so the checker carries no ABI table of its own to drift from
+`build.zig`'s; `want_interp` follows from the class, which is already tied to
+the ABI row, and the soname is one string for all five. The run step carries
+`has_side_effects = true`, so a cached second build does not skip the check.
+Negative cases were exercised: pointed at a text file it fails on the magic, and
+with the file absent it fails on `ArtefactUnreadable`.
+
+**The installed artefact is named for the cell that produced it**, as
+`ndk-link-check-<abi>-api<level>`. It used to be a fixed `ndk-link-check`, which
+meant a five-ABI matrix run installed every cell to the same filename and left
+five runs overwriting one name, so a reader inspecting `zig-out/bin` could not
+tell which cells had been checked. Now every cell leaves its own file and
+`zig-out/bin` is the coverage record — which is also why this entry says five
+ABIs link rather than two.
+
+The artefact is named for the ABI and API it was built for, and `ndk-elf-check`
+reads that exact file back rather than trusting the compile step's success. Note
+that one cell does not reproduce the `file(1)` line this repository quotes
+elsewhere: `x86_64` in `Debug` loses `.note.android.ident`, so `file -b` does
+not report `built by NDK r29` for that artefact alone. The gate never read that
+note — it verifies the four fields above, none of which depend on it.
 
 **Enforcer: the gate itself, plus this entry.** The general rule — never let a
 gate go green meaning "nothing failed" when it could equally mean "nothing was
@@ -449,26 +472,28 @@ bump. Read against the new tree, this entry and `Abi.name` are re-read together.
 
 Known, and not done. Recording them is more useful than leaving them implied.
 
-- **Per-ABI link proof for three of the five ABIs.** `ndk-link-check` was
-  observed linking `arm64-v8a` and `riscv64`, both at API 35: in each case
-  `zig-out/bin/ndk-link-check` is written and passes the ELF-header check, and
-  `file(1)` reads the arm64 one as an aarch64 Android PIE with interpreter
-  `/system/bin/linker64`, for Android 35, built by NDK r29 (14206865).
-  `ndk-abi-check` *compiles* the other three, which is a different claim from
-  having watched each one link. `-Dabi=<name>` and `-Dapi=<n>` are what close
-  that. **The API-21 legs do not link as the package is configured**:
-  `armeabi-v7a`, `x86` and `arm64-v8a` fail on `undefined symbol: preadv64`,
-  `x86_64` on `pwritev64`. Bionic gained both at API 24 and Zig's default panic
-  handler reaches them, so those legs want `-Dapi=35` or
-  `-Doptimize=ReleaseSmall`. That is a property of bionic, not of the sysroot
-  description this package provides — but it does mean per-ABI coverage is the
-  open question, not the mechanism.
-- **No gate reads past the ELF header.** `ndk-elf-check` confirms the magic,
-  `EI_CLASS`, `EI_DATA`, `EI_OSABI` and `e_machine`, which is enough to refuse a
-  host artefact or one for the wrong ABI. It does not parse the program headers
-  or the dynamic section: that the artefact links `libc.so` and `libm.so` and
-  carries interpreter `/system/bin/linker64` is established by reading it with
-  `file(1)`, which no gate in this tree does.
+- **Per-ABI link coverage is complete at API 35** — recorded here rather than as
+  a gap, so a later reader can tell it apart from what is still open. All five
+  cells were run and each artefact checked against its own row: `EI_CLASS` 1 for
+  `armeabi-v7a` and `x86` and 2 for the rest, `e_machine` ARM 40 / AARCH64 183 /
+  RISCV 243 / 386 / X86_64 62, `PT_INTERP /system/bin/linker` for the two 32-bit
+  ABIs and `/system/bin/linker64` for the three 64-bit ones, and `DT_NEEDED`
+  naming exactly `libc.so` in all five. Each artefact is
+  `zig-out/bin/ndk-link-check-<abi>-api<level>`, so `zig-out/bin` records which
+  cells ran. What is *not* covered is the API level, next bullet.
+- **The API floor below 35 is refused, not discovered.** The four 21-floor ABIs
+  cannot link at API 21–23 in `Debug` or `ReleaseSafe` — bionic gained
+  `preadv64`/`pwritev64` at API 24 and Zig's default panic handler reaches both —
+  and link from 24 down in `ReleaseFast` or `ReleaseSmall`. `riscv64` is refused
+  below **its own** floor of 35 in every mode, because r29 ships no
+  `usr/lib/riscv64-linux-android/21` to link against. The predicate is
+  `api_level < @max(min_link_api_level, gate.min_api_level)`, so the guard is
+  not ABI-blind and `riscv64`'s refusal names 35 instead of a remedy that cannot
+  work there.
+- **No gate checks the artefact against the Android API level itself.** The four
+  checks are `EI_CLASS`, `e_machine`, `PT_INTERP` and `DT_NEEDED`; none reads the
+  API level, so an artefact linked against a different level than `-Dapi=`
+  asked for would pass. `file(1)` reports the level, and no gate runs it.
 - **`EI_OSABI` does not separate bionic from glibc.** NDK r29 stamps
   `ELFOSABI_NONE` (0) on `libc.so` for all five ABIs and every API level —
   read from the unpacked tree — so the checker accepts 0 or 97 and refuses every
