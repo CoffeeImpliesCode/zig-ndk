@@ -648,7 +648,7 @@ jobs:
               const abi = ndk.Abi.arm64_v8a;
               const tag = try ndk.Ndk.hostTag(@import("builtin").target);
               std.debug.print("abi   {s} {s} api {d}\n", .{
-                  abi.directoryName(),
+                  abi.name(),
                   abi.triple(),
                   abi.minApiLevel(),
               });

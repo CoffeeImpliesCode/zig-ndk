@@ -13,6 +13,23 @@
 # It is also the only thing standing between a silent NDK bump and a build that
 # resolves sysroot paths which do not exist.
 #
+# WHAT IT DOES NOT CHECK, and who does. This script verifies the FACTS: the
+# release, the revision, the archive digests, and that the ABI table this
+# package ships matches the ABI table in the NDK it is pointed at. It does not
+# verify that the tree it was pointed at is the one those bytes unpacked to --
+# the 783 MB of sysroot binaries stay unbound to the archive, because binding
+# them is `ndk-link-check`'s job and not this script's.
+#
+# That division is deliberate and it holds. Measured on a hand-made NDK whose
+# metadata is copied verbatim from a real r29 and whose sysroot is an empty
+# directory: this script passes it, and `ndk-link-check` refuses it with
+# "'<sysroot>/usr/include/stdio.h' is not in this sysroot: FileNotFound".
+# A forged NDK therefore has to satisfy two independent gates, and the one
+# that actually uses the toolchain is the one that notices. Do not widen this
+# script into a full-tree comparison to close the gap alone; that would put
+# 783 MB of hashing in a gate that runs on every build, to defend against a
+# threat the other gate already catches.
+#
 # It does NOT verify the libc paths file format in src/libc_file.zig. That is a
 # Zig compiler fact, not an NDK fact, and it moves with the compiler rather than
 # with Google. CHANGELOG.md p0004 says so in words as well, because "nothing
@@ -760,15 +777,19 @@ fi
 # starts in column zero. A reshape of them is a change this script must be
 # taught, and the count check below is what says so out loud.
 awk -v tagfile="$WORK/declared.tsv" -v blindfile="$WORK/blind.txt" '
-    # Scoped to the Abi enum on purpose: HostTag.directoryName has the same
-    # name and would otherwise contribute host tags to the ABI table.
+    # Scoped to the Abi enum on purpose. HostTag.directoryName is a DIFFERENT
+    # function under a different name now — `Abi.directoryName` was renamed to
+    # `Abi.name`, because an ABI name is a meta/abis.json key and not a path
+    # component of sysroot/usr/lib, which is namespaced by triple. The scoping
+    # below is what would catch a future `name` accessor appearing on another
+    # type in the same file and contributing rows to the ABI table.
     /^pub const Abi = enum \{/  { in_abi = 1; next }
     /^\};/                     { in_abi = 0; next }
     in_abi == 0                { next }
     /^[[:space:]]*\/\//        { next }
-    /^[[:space:]]*pub fn directoryName\(/ { mode = "dir";  next }
-    /^[[:space:]]*pub fn triple\(/        { mode = "trip"; next }
-    /^[[:space:]]*pub fn minApiLevel\(/   { mode = "min";  next }
+    /^[[:space:]]*pub fn name\(/             { mode = "dir";  next }
+    /^[[:space:]]*pub fn triple\(/           { mode = "trip"; next }
+    /^[[:space:]]*pub fn minApiLevel\(/      { mode = "min";  next }
     /^\}/                      { mode = "";      next }
     # The tag list of the enum itself. It is compared against the tags the
     # three accessors cover, because a tag deleted from the enum while its

@@ -109,20 +109,15 @@ const max_properties_bytes = 1024 * 1024;
 
 /// One of the five ABIs an NDK ships libraries for.
 ///
-/// Values were read from r29's `meta/abis.json`, where the ABI name is the
-/// entry key. That name is a name and not a path: `sysroot/usr/lib/` is
-/// namespaced by sysroot triple, not by ABI name, and in r29 it holds exactly
-/// the five triple directories and nothing else. There is no `arm64-v8a`
-/// directory anywhere under `sysroot/usr/`, so a consumer that joins this name
-/// onto a sysroot gets ENOENT and no gate in this package notices, because
-/// every path here is built from `triple`. A consumer wanting a directory uses
-/// `triple`; a consumer wanting an `ANDROID_ABI` uses `directoryName`.
+/// The name is the key of this ABI's entry in r29's `meta/abis.json`, and the
+/// value `ANDROID_ABI` takes. `sysroot/usr/lib/` is namespaced by sysroot
+/// triple instead, so a directory is `triple` and never a name.
 ///
 /// The Zig tag is the ABI name with `-` written `_`. That is a spelling
 /// change, not an identity: `.armeabi_v7a` and `.arm64_v8a` carry the
 /// `v7a`/`v8a` marker that their library triple does not, and no tag here is
-/// the NDK's own spelling of anything. Reach that spelling through
-/// `directoryName`, never through `@tagName`.
+/// the NDK's own spelling of anything. Reach that spelling through `name`,
+/// never through `@tagName`.
 pub const Abi = enum {
     /// `armeabi-v7a`: 32-bit ARM, API 21 floor.
     armeabi_v7a,
@@ -137,21 +132,14 @@ pub const Abi = enum {
     x86_64,
 
     /// The ABI's name as the NDK's own tooling writes it: the key of its entry
-    /// in `meta/abis.json`, and the value `ANDROID_ABI` and CMake's
-    /// `ANDROID_ABI` take.
+    /// in `meta/abis.json`, and the value `ANDROID_ABI` takes.
     ///
-    /// It is not a path component of the sysroot. `sysroot/usr/lib/` holds
-    /// exactly five directories, and each is named by sysroot triple — `triple`
-    /// is the accessor for them, and this is not the accessor for any path.
-    /// There is no `arm64-v8a` directory anywhere under `sysroot/usr/`, so
-    /// joining this name onto `sysroot/usr/lib/` fails with ENOENT, and nothing
-    /// in this package catches it, because every path this package builds comes
-    /// from `triple`. Use `triple` for a directory and this for an
-    /// `ANDROID_ABI`; `fromDirectoryName` is the inverse.
+    /// Not a path component of the sysroot. `sysroot/usr/lib/` is namespaced by
+    /// sysroot triple, and `triple` returns that; `fromName` is the inverse.
     ///
     /// Borrowed from a string literal, so the slice has static lifetime and
     /// the caller frees nothing.
-    pub fn directoryName(self: Abi) []const u8 {
+    pub fn name(self: Abi) []const u8 {
         return switch (self) {
             .armeabi_v7a => "armeabi-v7a",
             .arm64_v8a => "arm64-v8a",
@@ -161,8 +149,8 @@ pub const Abi = enum {
         };
     }
 
-    /// The ABI whose NDK name is exactly `name`, or `null` when no ABI carries
-    /// that name.
+    /// The ABI whose NDK name is exactly `wanted`, or `null` when no ABI
+    /// carries that name.
     ///
     /// Exact byte equality, and nothing looser. No case folding — the NDK
     /// spells `x86_64` in lower case and a case-folded match would accept a
@@ -172,27 +160,25 @@ pub const Abi = enum {
     /// spelling would let a caller pass `-Dabi=arm64_v8a` and silently get
     /// the ABI for a name no NDK tooling writes.
     ///
-    /// This is the inverse of `directoryName`, and it exists so that a consumer
-    /// turning a name it was given back into an ABI does not carry its own copy
-    /// of the five-entry table. Two copies are how two callers come to disagree
-    /// about whether `arm64-v8a` is a valid ABI, and the loser of that argument
-    /// fails at configure time with a message about a directory that was never
-    /// in question.
+    /// This is the inverse of `name`, and it exists so that a consumer turning
+    /// a name it was given back into an ABI does not carry its own copy of the
+    /// five-entry table. Two copies are how two callers come to disagree about
+    /// whether `arm64-v8a` is a valid ABI.
     ///
     /// `null` for the empty string and for every name not in the table. It is a
     /// pure function of the tag; nothing here touches the filesystem, so a
     /// `null` says the name is not one of the five, not that the ABI is missing
     /// from some particular installation.
-    pub fn fromDirectoryName(name: []const u8) ?Abi {
+    pub fn fromName(wanted: []const u8) ?Abi {
         for (std.enums.values(Abi)) |abi| {
-            if (std.mem.eql(u8, abi.directoryName(), name)) return abi;
+            if (std.mem.eql(u8, abi.name(), wanted)) return abi;
         }
         return null;
     }
 
     /// The sysroot triple this ABI's libraries live under.
     ///
-    /// This is neither a Zig triple nor the ABI directory name. It is the
+    /// This is neither a Zig triple nor the ABI name. It is the
     /// `triple` field of the ABI's entry in `meta/abis.json`, and it is the
     /// directory name directly under `sysroot/usr/lib`, above the API levels.
     ///
@@ -1314,32 +1300,32 @@ fn createNdk(
     return root;
 }
 
-test "ABI directory names round-trip to the names the NDK uses on disk" {
-    // Straight from r29's meta/abis.json keys. A tag is not a directory name;
-    // only this mapping reaches the on-disk spelling.
-    try testing.expectEqualStrings("armeabi-v7a", Abi.armeabi_v7a.directoryName());
-    try testing.expectEqualStrings("arm64-v8a", Abi.arm64_v8a.directoryName());
-    try testing.expectEqualStrings("riscv64", Abi.riscv64.directoryName());
-    try testing.expectEqualStrings("x86", Abi.x86.directoryName());
-    try testing.expectEqualStrings("x86_64", Abi.x86_64.directoryName());
+test "ABI names round-trip to the meta/abis.json keys" {
+    // Straight from r29's meta/abis.json keys. A tag is not an ABI name; only
+    // this mapping reaches the NDK's own spelling.
+    try testing.expectEqualStrings("armeabi-v7a", Abi.armeabi_v7a.name());
+    try testing.expectEqualStrings("arm64-v8a", Abi.arm64_v8a.name());
+    try testing.expectEqualStrings("riscv64", Abi.riscv64.name());
+    try testing.expectEqualStrings("x86", Abi.x86.name());
+    try testing.expectEqualStrings("x86_64", Abi.x86_64.name());
 
-    // The enum is exactly the five r29 ABIs, and every directory name is
-    // distinct, so no two ABIs can be confused for one another on disk.
+    // The enum is exactly the five r29 ABIs, and every name is distinct, so no
+    // two ABIs can be named for one another.
     const abis = std.enums.values(Abi);
     try testing.expectEqual(@as(usize, 5), abis.len);
     for (abis, 0..) |a, i| {
         for (abis, 0..) |b, j| {
             if (j <= i) continue;
-            try testing.expect(!std.mem.eql(u8, a.directoryName(), b.directoryName()));
+            try testing.expect(!std.mem.eql(u8, a.name(), b.name()));
             try testing.expect(!std.mem.eql(u8, a.triple(), b.triple()));
         }
     }
 
-    // The mapping is not the identity: a tag is never usable as a directory
-    // name, which is why @tagName must never be used to build a path. Only the
-    // three ABIs whose directory name has no dash can coincide with their tag.
+    // The mapping is not the identity: a tag is never the NDK's spelling of its
+    // ABI, which is why @tagName must never be used to name one. Only the three
+    // ABIs whose name carries no dash can coincide with their tag.
     for (abis) |abi| {
-        if (!std.mem.eql(u8, abi.directoryName(), @tagName(abi))) continue;
+        if (!std.mem.eql(u8, abi.name(), @tagName(abi))) continue;
         try testing.expect(std.mem.indexOfScalar(u8, @tagName(abi), '-') == null);
     }
 }
@@ -2069,17 +2055,17 @@ test "a root that is a plain file is not an NDK" {
     try testing.expect(std.mem.indexOf(u8, message, "ndk_bundle:") != null);
 }
 
-test "an ABI round-trips through its on-disk directory name" {
+test "an ABI round-trips through its NDK name" {
     // Every name the NDK ships maps back, and nothing else does.
     for (std.enums.values(Abi)) |abi| {
-        try testing.expectEqual(abi, Abi.fromDirectoryName(abi.directoryName()));
+        try testing.expectEqual(abi, Abi.fromName(abi.name()));
     }
-    try testing.expectEqual(Abi.arm64_v8a, Abi.fromDirectoryName("arm64-v8a"));
+    try testing.expectEqual(Abi.arm64_v8a, Abi.fromName("arm64-v8a"));
 
     // The inverse is exact, and every one of these is the way a caller
-    // misspells the name: the Zig tag for the directory name, the shouted
-    // spelling, a trailing separator carried over from a path, a name with a
-    // stray space, and the empty string.
+    // misspells the name: the Zig tag for the ABI, the shouted spelling, a
+    // trailing separator carried over from a path, a name with a stray space,
+    // and the empty string.
     const rejected = [_][]const u8{
         "arm64_v8a",
         "ARM64-V8A",
@@ -2091,7 +2077,7 @@ test "an ABI round-trips through its on-disk directory name" {
         "",
     };
     for (rejected) |name| {
-        try testing.expectEqual(@as(?Abi, null), Abi.fromDirectoryName(name));
+        try testing.expectEqual(@as(?Abi, null), Abi.fromName(name));
     }
 
     // The five names are distinct, so no name can resolve to two ABIs.
@@ -2099,7 +2085,7 @@ test "an ABI round-trips through its on-disk directory name" {
     for (abis, 0..) |a, i| {
         for (abis, 0..) |b, j| {
             if (j <= i) continue;
-            try testing.expect(Abi.fromDirectoryName(a.directoryName()) != b);
+            try testing.expect(Abi.fromName(a.name()) != b);
         }
     }
 }
