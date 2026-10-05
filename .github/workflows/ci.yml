@@ -1,0 +1,333 @@
+# CI for zig-ndk.
+#
+# Gate names come from build.zig, registered there as Zig 0.16.0 build steps:
+#
+#   zig build fmt-check       addFmt(.{ .check = true }) — formatting
+#   zig build test            host unit tests, b.addTest + b.addRunArtifact
+#   zig build ndk-abi-check   one cross-compiled test binary per NDK ABI
+#   zig build ndk-link-check  links a real bionic binary against a real sysroot
+#   zig build check           test + ndk-abi-check (the contract gate; the
+#                             test and cross jobs below run its two halves)
+#
+# The link job is the only one that provisions the pinned NDK, because
+# ndk-link-check is the only gate that reads a sysroot. The other three gates
+# prove something that needs no NDK at all, and a green run for each is the
+# evidence that the sysroot stays optional.
+#
+# --- Known gap: foundation contract §4.3 item 5, Tier-2 host targets --------
+# The contract asks for cross-compilation gates on x86_64-linux (Tier 1) and
+# aarch64-linux, aarch64-macos, x86_64-windows, riscv64-linux, wasm32-wasi
+# (Tier 2). What this file gates is:
+#
+#   x86_64-linux   the fmt, test and licence jobs' own runner, natively
+#   riscv64-linux  the riscv64 entry of ndk-abi-check — a different ABI,
+#                  not the host OS, and it is an Android target
+#
+# NOT gated here: aarch64-linux, aarch64-macos, x86_64-windows, and
+# wasm32-wasi as host targets. Item 5 is therefore open for this package, and
+# this comment is the disclosure — a red job would say less.
+#
+# The closing mechanism is not settled. build.zig's `test` step already
+# degrades to compile-only under a foreign `-Dtarget` (build.zig:181-194:
+# `isNative()` false means it depends on the compile, logs that it did not
+# run, and does not fail), so `zig build test -Dtarget=aarch64-linux` is the
+# obvious candidate — but no CI run has proven this package compiles for
+# those triples, and a gate that has never been green is not a gate. It is
+# left unwired rather than wired and red.
+name: CI
+
+# Item 7 of the foundation per-fork contract (/home/janis/foundation/docs/
+# 01-first-wave.md §4.3): every commit builds. Push covers the fork's own
+# branches, pull_request covers every outside contributor's commit.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# No job writes to the repository or needs a token beyond reading the tree.
+permissions:
+  contents: read
+
+# A superseded push must not keep a runner busy: the newer commit's result is
+# the one that matters.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Zig 0.16.0 is the compiler this package targets: `.minimum_zig_version` in
+  # build.zig.zon and `zig_0_16` in devenv.nix are the same pin. The tag, not a
+  # branch — the workflow must not move under a green run.
+  ZIG_VERSION: "0.16.0"
+
+  # Repo-local, and already in .gitignore. This is the absolute form of the
+  # same directory devenv.nix pins, spelled out because a relative value
+  # resolves against whatever directory the command runs from: a build run
+  # from a subdirectory would land back in the shared global cache, which is
+  # the lock convoy this pin exists to keep CI off.
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+
+  # --- Compiler record for the pinned Android NDK -------------------------
+  # Both values are facts about one artefact, not choices, and both are recorded
+  # in tools/ndk.sha256, which tools/sync-ndk.sh re-resolves and fails if either
+  # moves. They live here as workflow-level constants so a reviewer sees the
+  # whole pin — version code and hash — in one place.
+  #
+  #   NDK_VERSION_CODE  source.properties, Pkg.Revision, NDK r29
+  #   NDK_ZIP_SHA256    the published linux-x86_64 zip, as downloaded
+  #   NDK_ZIP_SIZE      the same zip's byte length, as a cheap truncation guard
+  NDK_VERSION_CODE: "29.0.14206865"
+  NDK_ZIP_SHA256: "4abbbcdc842f3d4879206e9695d52709603e52dd68d3c1fff04b3b5e7a308ecf"
+  NDK_ZIP_SIZE: "783549481"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Canonical home is https://codeberg.org/mlugg/setup-zig; the
+      # github.com/mlugg/setup-zig repository is its labelled read-only mirror
+      # and is what GitHub Actions can resolve. Pin the v2 tag.
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          # The action's own cache is hardcoded to $GITHUB_WORKSPACE/.zig-cache
+          # (common.js getZigCachePath), which is not the directory devenv.nix
+          # pins, so the cache below is ours to do.
+          use-cache: false
+
+      - name: Pin the Zig cache to the repo-local directory
+        run: |
+          set -euo pipefail
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+          # setup-zig unconditionally exportVariable()s
+          # ZIG_GLOBAL_CACHE_DIR=<workspace>/.zig-cache (main.js:186), and a
+          # GITHUB_ENV write outranks the workflow `env:` block. Re-export ours
+          # so the gate uses the same directory devenv.nix names.
+          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-
+
+      - name: Format gate
+        run: zig build fmt-check
+
+  # ---------------------------------------------------------------------------
+  # Hard requirement of the package design: a consumer who has no NDK
+  # installed, and sets no ANDROID_NDK_* variable, must still be able to build
+  # and run the host tests. So this job provisions no NDK and asserts nothing
+  # about one — a green run here is the evidence that the sysroot is optional.
+  test:
+    name: test (host, no NDK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+
+      - name: Pin the Zig cache to the repo-local directory
+        run: |
+          set -euo pipefail
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-
+
+      - name: Host unit tests
+        run: zig build test
+
+  # ---------------------------------------------------------------------------
+  cross:
+    name: cross (all five NDK ABIs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+
+      - name: Pin the Zig cache to the repo-local directory
+        run: |
+          set -euo pipefail
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-
+
+      # One command, all five ABIs: `ndk-abi-check` takes no ABI selector.
+      # build.zig loops its whole abi_gates table and hangs all five compile
+      # steps off that one step, so this is the claim for every ABI the NDK
+      # declares. This job used to fan the identical command out over a
+      # five-entry matrix — five names, one gate, five times the minutes —
+      # and a red leg's matrix entry name implied an ABI the command never
+      # selected. Per-ABI legs become real only when build.zig can be told
+      # which ABI to check; it cannot today, so the job says what it runs.
+      #
+      # The record of what those five ABIs are, and the floor each is compiled
+      # at. riscv64's floor is 35, not 21, because the ABI postdates API 21; a
+      # single api-level column for all five would encode a false claim for
+      # four of them and pass anyway. Zig carries the level natively in the
+      # target query and build.zig holds the authoritative copy of the table,
+      # so `zig build ndk-abi-check --summary all` prints the triple and API
+      # level each ABI was actually compiled for.
+      #
+      #   abi           sysroot triple             API floor
+      #   armeabi-v7a   arm-linux-androideabi        21
+      #   arm64-v8a     aarch64-linux-android        21
+      #   riscv64       riscv64-linux-android        35
+      #   x86           i686-linux-android           21
+      #   x86_64        x86_64-linux-android         21
+      #
+      # No NDK here, and that is the gate's own design, not an omission.
+      # `ndk-abi-check` resolves a `std.Target.Query` per ABI from build.zig's
+      # internal copy of r29's `meta/abis.json` and compiles the package for
+      # it. It reads no sysroot, needs no ANDROID_NDK_* variable, and is green
+      # on a machine that has never seen an NDK — which is why this job
+      # provisions nothing and the 783 MB NDK is fetched only by the link job.
+      #
+      # What this gate proves is that the published module compiles for every
+      # ABI the NDK declares. Whether the sysroot paths behind those ABIs are
+      # right is the link gate's claim, and the link job is where the NDK is
+      # provisioned.
+      - name: Cross-ABI gate (compiles the package for all five NDK ABIs)
+        run: zig build ndk-abi-check
+
+  # ---------------------------------------------------------------------------
+  # Highest timeout in this file, on purpose. ndk-link-check is the only gate
+  # that proves Zig will link a real bionic Android binary against a real NDK
+  # sysroot: a freestanding binary already links without the NDK, so this is
+  # the step that decides whether the package is useful or a description of
+  # one. It also has the longest non-build prefix — 783 MB fetched, hashed and
+  # unpacked into ~120k files — and if it is going to be cut short, it should
+  # be this job that gets the time.
+  link:
+    name: link (bionic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+
+      - name: Pin the Zig cache to the repo-local directory
+        run: |
+          set -euo pipefail
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-
+
+      - name: Provision the pinned Android NDK
+        env:
+          NDK_ZIP_URL: https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+        run: |
+          set -euo pipefail
+          zip="$RUNNER_TEMP/ndk.zip"
+          curl --fail --location --retry 3 --show-error --output "$zip" "$NDK_ZIP_URL"
+          echo "${NDK_ZIP_SHA256}  ${zip}" | sha256sum --check --strict -
+          test "$(stat -c %s "$zip")" -eq "${NDK_ZIP_SIZE}"
+          mkdir -p "$RUNNER_TEMP/ndk"
+          unzip -q "$zip" -d "$RUNNER_TEMP/ndk"
+          ndk_home="$(find "$RUNNER_TEMP/ndk" -mindepth 1 -maxdepth 1 -type d -name 'android-ndk-*')"
+          test -n "${ndk_home}"
+          test -d "${ndk_home}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          # A hash pins the bytes; the revision pins what those bytes claim to
+          # be. Read it back out of the artefact rather than trusting the file
+          # name, and require every copy in the zip to agree with the pin.
+          revision="$(unzip -p "$zip" '*/source.properties' \
+            | sed -n 's/^Pkg\.Revision[[:space:]]*=[[:space:]]*//p' | sort -u)"
+          test "${revision}" = "${NDK_VERSION_CODE}" || {
+            echo "::error::unpacked NDK reports Pkg.Revision '${revision}', workflow pins ${NDK_VERSION_CODE}"
+            exit 1
+          }
+          echo "ANDROID_NDK_HOME=${ndk_home}" >> "$GITHUB_ENV"
+
+      # ANDROID_NDK_HOME is the first candidate in build.zig's discovery order;
+      # -Dndk is the explicit override above all four, so both the environment
+      # route a consumer would take and the flag route a packager would take
+      # are exercised by the same run.
+      - name: libc link gate
+        run: zig build ndk-link-check -Dndk="${ANDROID_NDK_HOME}"
+
+  # ---------------------------------------------------------------------------
+  # Item 8 of the per-fork contract: a licence gate in CI. Allowlisted are
+  # MIT/ISC/BSD/Zlib/Apache-2.0/BSL-1.0/public-domain; GPL-2.0 and GPL-3.0 are
+  # a hard reject; NOASSERTION is a reject until someone resolves it. The rule
+  # lives in CI because a relicensing pull request is otherwise invisible in a
+  # diff of source files.
+  licence:
+    name: licence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Licence allowlist
+        run: |
+          set -euo pipefail
+          test -s LICENSE || { echo "::error::LICENSE is missing or empty"; exit 1; }
+
+          # Match both the abbreviation and the spelled-out title: a rejection
+          # that only sees "GPLv3" misses "GNU General Public License Version 3",
+          # which is the same licence.
+          if grep -Eqi '\b(a|l)?gpl\b|(general|lesser|affero)[[:space:]]+public[[:space:]]+licen[cs]e' LICENSE; then
+            echo "::error::LICENSE names a GPL or LGPL licence; foundation §4.3 item 8 hard-rejects it."
+            exit 1
+          fi
+
+          if grep -q NOASSERTION LICENSE; then
+            echo "::error::LICENSE is unresolved (NOASSERTION); foundation §4.3 item 8 rejects it until resolved."
+            exit 1
+          fi
+
+          # Match each licence as it actually writes its name, not only the SPDX
+          # hyphenated form: "Apache License Version 2.0" grants the same rights
+          # as "Apache-2.0" and must not fail the gate.
+          allowed='MIT|ISC|BSD(-[23])?(-[Cc]lause)?|Zlib|Apache-2\.0|Apache[[:space:]]+[Ll]icen[cs]e|Boost[[:space:]]+[Ss]oftware[[:space:]]+[Ll]icen[cs]e|BSL-1\.0|public[- ]domain|[Uu]nlicense|CC0-1\.0'
+          if ! grep -Eqi "(^|[^A-Za-z0-9-])(${allowed})([^A-Za-z0-9-]|$)" LICENSE; then
+            echo "::error::LICENSE carries no allowlisted licence name; foundation §4.3 item 8 accepts MIT, ISC, BSD-2, BSD-3, Zlib, Apache-2.0, BSL-1.0, public domain and Unlicense only."
+            exit 1
+          fi
+
+          echo "licence gate: allowlisted identifier found in LICENSE"

@@ -1,0 +1,17 @@
+# The pinned Android NDK release.
+#
+# One line of evidence per fact, in the order a reader checks them:
+#
+#   release     the NDK's own name for the release          (meta/../source.properties, Pkg.ReleaseName)
+#   revision    the NDK's own revision                       (source.properties, Pkg.Revision)
+#   size        the byte length of the zip below             (wc -c)
+#   sha256      the zip, as published                        (sha256sum)
+#
+# `tools/sync-ndk.sh` re-resolves all four and fails if any moves. A new line
+# here is not a formality: see CHANGELOG.md, which records every fact in this
+# file as something an NDK bump has to revisit.
+
+release = r29
+revision = 29.0.14206865
+size = 783549481
+sha256 = 4abbbcdc842f3d4879206e9695d52709603e52dd68d3c1fff04b3b5e7a308ecf

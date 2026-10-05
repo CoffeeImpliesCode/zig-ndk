@@ -1,0 +1,1807 @@
+//! Android NDK discovery and layout facts for Zig 0.16.0.
+//!
+//! Zig 0.16.0 has no NDK awareness at all: `lib/std/Build.zig` never mentions
+//! android, and `lib/libc/` ships darwin, freebsd, glibc, mingw, musl, netbsd,
+//! openbsd, wasi and include. There is no bionic. A freestanding
+//! `aarch64-linux-android` binary links; anything that needs `libc.so`, the CRT
+//! objects or `stdio.h` does not, because there is nothing to point at.
+//!
+//! This module resolves an NDK installation on disk and reports where its
+//! sysroot, its per-ABI libraries and its per-API-level CRT objects live. The
+//! five ABI facts below were read from r29's `meta/abis.json`, not from a
+//! specification; nothing here hardcodes a path table, so an NDK at another
+//! revision, host tag or API level is described by probing it.
+
+const std = @import("std");
+
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+const Dir = std.Io.Dir;
+const Environ = std.process.Environ;
+const File = std.Io.File;
+const Io = std.Io;
+const Target = std.Target;
+const Writer = std.Io.Writer;
+const path = std.fs.path;
+
+/// Every refusal a caller of this module can act on.
+///
+/// Closed. No declaration in this file widens it to `anyerror`. The only other
+/// errors that can surface are `Allocator.Error` and the filesystem errors of
+/// `std.Io.Dir`, both of which pass through unchanged because they describe the
+/// machine, not the NDK.
+pub const Error = error{
+    /// No candidate path was set, and every candidate that was set is not on
+    /// disk. The caller can act by setting the `-Dndk` build option, or one of
+    /// `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK`.
+    NdkNotFound,
+    /// A candidate path exists, but neither layout probed under it holds a
+    /// `toolchains/llvm/prebuilt/<host-tag>/sysroot`. The caller pointed at an
+    /// archive rather than an unpacked NDK, at an SDK root rather than an NDK,
+    /// or at an NDK unpacked for another host tag. `Ndk.Shape` names the two
+    /// layouts that are recognised; `Ndk.probeCandidates` names the two paths
+    /// that were probed under any root, and `Ndk.describeProbeFailure` renders
+    /// the refusal message CONTRACT.md D3 asks for.
+    NotAnNdk,
+    /// The host has no NDK host tag, so no NDK package ships a prebuilt
+    /// toolchain for it. The caller can act only by building on one of the
+    /// hosts in `HostTag`, or by crossing the NDK toolchain by hand.
+    UnsupportedHost,
+    /// This NDK has no `usr/lib/<triple>` for the requested ABI, so the ABI is
+    /// not among the ones this NDK ships. The caller can act by picking an ABI
+    /// this NDK carries.
+    UnsupportedAbi,
+    /// `usr/lib/<triple>` exists but holds no directory for that API level.
+    /// The caller can act by picking one of `Ndk.apiLevelsFor`.
+    ApiLevelUnavailable,
+    /// `source.properties` is present but holds no parsable `Pkg.Revision`. The
+    /// installation is otherwise fully usable; only its version is unknown.
+    VersionUnreadable,
+};
+
+/// Filesystem refusals that pass through `Ndk.open`, `Ndk.find`,
+/// `Ndk.libcDirFor`, `Ndk.apiLevelsFor`, `Ndk.probeCandidates`,
+/// `Ndk.describeProbeFailure` and `Ndk.readVersion` unchanged.
+///
+/// Probing is a `stat`, not an `access`. `Dir.AccessError` is gone because
+/// nothing calls `Dir.accessAbsolute` any more, and an error set that names a
+/// failure no call can produce is a claim this file cannot keep. Nothing a
+/// caller can observe leaves with it: `AccessDenied` and `PermissionDenied`
+/// are members of `File.OpenError`, which `Dir.StatFileError` includes.
+const FsError = Dir.RealPathFileAllocError || Dir.StatFileError || Dir.OpenError ||
+    Dir.ReadFileAllocError || Dir.Iterator.Error;
+
+/// The largest `source.properties` `Ndk.readVersion` will read.
+///
+/// The r29 file is four lines of about 110 bytes. A megabyte is generous
+/// enough that no real NDK hits the limit and small enough that pointing this
+/// at a wrong file cannot exhaust memory.
+const max_properties_bytes = 1024 * 1024;
+
+/// One of the five ABIs an NDK ships libraries for.
+///
+/// Values were read from r29's `meta/abis.json`, where the ABI name is the
+/// entry key. That name is a name and not a path: `sysroot/usr/lib/` is
+/// namespaced by sysroot triple, not by ABI name, and in r29 it holds exactly
+/// the five triple directories and nothing else. There is no `arm64-v8a`
+/// directory anywhere under `sysroot/usr/`, so a consumer that joins this name
+/// onto a sysroot gets ENOENT and no gate in this package notices, because
+/// every path here is built from `triple`. A consumer wanting a directory uses
+/// `triple`; a consumer wanting an `ANDROID_ABI` uses `directoryName`.
+///
+/// The Zig tag is the ABI name with `-` written `_`. That is a spelling
+/// change, not an identity: `.armeabi_v7a` and `.arm64_v8a` carry the
+/// `v7a`/`v8a` marker that their library triple does not, and no tag here is
+/// the NDK's own spelling of anything. Reach that spelling through
+/// `directoryName`, never through `@tagName`.
+pub const Abi = enum {
+    /// `armeabi-v7a`: 32-bit ARM, API 21 floor.
+    armeabi_v7a,
+    /// `arm64-v8a`: 64-bit ARM, API 21 floor.
+    arm64_v8a,
+    /// `riscv64`: 64-bit RISC-V, API 35 floor. The only ABI r29 ships one
+    /// API level for.
+    riscv64,
+    /// `x86`: 32-bit Intel, API 21 floor.
+    x86,
+    /// `x86_64`: 64-bit Intel, API 21 floor.
+    x86_64,
+
+    /// The ABI's name as the NDK's own tooling writes it: the key of its entry
+    /// in `meta/abis.json`, and the value `ANDROID_ABI` and CMake's
+    /// `ANDROID_ABI` take.
+    ///
+    /// It is not a path component of the sysroot. `sysroot/usr/lib/` holds
+    /// exactly five directories, and each is named by sysroot triple — `triple`
+    /// is the accessor for them, and this is not the accessor for any path.
+    /// There is no `arm64-v8a` directory anywhere under `sysroot/usr/`, so
+    /// joining this name onto `sysroot/usr/lib/` fails with ENOENT, and nothing
+    /// in this package catches it, because every path this package builds comes
+    /// from `triple`. Use `triple` for a directory and this for an
+    /// `ANDROID_ABI`; `fromDirectoryName` is the inverse.
+    ///
+    /// Borrowed from a string literal, so the slice has static lifetime and
+    /// the caller frees nothing.
+    pub fn directoryName(self: Abi) []const u8 {
+        return switch (self) {
+            .armeabi_v7a => "armeabi-v7a",
+            .arm64_v8a => "arm64-v8a",
+            .riscv64 => "riscv64",
+            .x86 => "x86",
+            .x86_64 => "x86_64",
+        };
+    }
+
+    /// The ABI whose NDK name is exactly `name`, or `null` when no ABI carries
+    /// that name.
+    ///
+    /// Exact byte equality, and nothing looser. No case folding — the NDK
+    /// spells `x86_64` in lower case and a case-folded match would accept a
+    /// name the NDK never writes. No trimming — a leading or trailing space is
+    /// a name the NDK does not write. No separator or suffix stripping —
+    /// `arm64_v8a` is the Zig tag for `arm64-v8a`, and accepting the tag
+    /// spelling would let a caller pass `-Dabi=arm64_v8a` and silently get
+    /// the ABI for a name no NDK tooling writes.
+    ///
+    /// This is the inverse of `directoryName`, and it exists so that a consumer
+    /// turning a name it was given back into an ABI does not carry its own copy
+    /// of the five-entry table. Two copies are how two callers come to disagree
+    /// about whether `arm64-v8a` is a valid ABI, and the loser of that argument
+    /// fails at configure time with a message about a directory that was never
+    /// in question.
+    ///
+    /// `null` for the empty string and for every name not in the table. It is a
+    /// pure function of the tag; nothing here touches the filesystem, so a
+    /// `null` says the name is not one of the five, not that the ABI is missing
+    /// from some particular installation.
+    pub fn fromDirectoryName(name: []const u8) ?Abi {
+        for (std.enums.values(Abi)) |abi| {
+            if (std.mem.eql(u8, abi.directoryName(), name)) return abi;
+        }
+        return null;
+    }
+
+    /// The sysroot triple this ABI's libraries live under.
+    ///
+    /// This is neither a Zig triple nor the ABI directory name. It is the
+    /// `triple` field of the ABI's entry in `meta/abis.json`, and it is the
+    /// directory name directly under `sysroot/usr/lib`, above the API levels.
+    ///
+    /// Borrowed from a string literal; the caller frees nothing.
+    pub fn triple(self: Abi) []const u8 {
+        return switch (self) {
+            .armeabi_v7a => "arm-linux-androideabi",
+            .arm64_v8a => "aarch64-linux-android",
+            .riscv64 => "riscv64-linux-android",
+            .x86 => "i686-linux-android",
+            .x86_64 => "x86_64-linux-android",
+        };
+    }
+
+    /// The lowest API level the NDK declares for this ABI, as `min_os_version`.
+    ///
+    /// A floor, not an inventory. `Ndk.apiLevelsFor` reports what is actually
+    /// on disk, and the two differ whenever an NDK ships fewer levels than it
+    /// permits: r29 declares 35 for `riscv64` and puts only 35 in the tree,
+    /// while the other four declare 21 and ship 21 upward.
+    pub fn minApiLevel(self: Abi) u32 {
+        return switch (self) {
+            .riscv64 => 35,
+            .armeabi_v7a, .arm64_v8a, .x86, .x86_64 => 21,
+        };
+    }
+
+    /// The `std.Target.Abi` a Zig cross build for this ABI must carry.
+    ///
+    /// Only 32-bit ARM is `.androideabi`; every other ABI is `.android`. The
+    /// distinction is not cosmetic. Zig picks the dynamic linker from the pair
+    /// (`std.Target`: `/system/bin/linker` for `arm` under `.androideabi`,
+    /// `/system/bin/linker64` for the 64-bit arches under `.android`) and picks
+    /// soft-float for `.androideabi`, so the wrong one either builds with the
+    /// wrong ABI or links nothing at all.
+    pub fn zigAbi(self: Abi) Target.Abi {
+        return switch (self) {
+            .armeabi_v7a => .androideabi,
+            .arm64_v8a, .riscv64, .x86, .x86_64 => .android,
+        };
+    }
+};
+
+/// The host tags the NDK publishes a prebuilt LLVM toolchain for: exactly
+/// three, all of them x86_64.
+///
+/// Source, and the reason the obvious-looking additions are absent. Google's
+/// own repository manifest for r29,
+/// https://dl.google.com/android/repository/repository2-3.xml, offers exactly
+/// three host packages and their betas:
+///
+///   android-ndk-r29-linux.zip      <host-os>linux</host-os>
+///   android-ndk-r29-darwin.zip     <host-os>macosx</host-os>
+///   android-ndk-r29-windows.zip    <host-os>windows</host-os>
+///   android-ndk-r29-beta{1..4}-{linux,darwin,windows}.zip
+///
+/// There is no linux-arm package and no darwin-arm package. Google's host-tag
+/// table at https://developer.android.com/ndk/guides/other_build_systems
+/// agrees: three rows, `darwin-x86_64`, `linux-x86_64`, `windows-x86_64`. The
+/// macOS package is named `darwin-x86_64` and runs on Apple Silicon under
+/// Rosetta; Google never emits `darwin-arm64`.
+///
+/// The r29 tree unpacked on this host agrees, with a single prebuilt directory:
+/// `toolchains/llvm/prebuilt/linux-x86_64`.
+///
+/// Do not add `linux_aarch64` or `darwin_arm64` back. Both look obviously
+/// necessary and neither exists, and having them here turns "no NDK is
+/// published for this host" into a misleading `error.NotAnNdk` about a
+/// path the user configured. A host that cannot be served has to fail as
+/// `error.UnsupportedHost`, which is a different problem with a different fix.
+///
+/// The Zig tag is the on-disk host tag with `-` written `_`; `directoryName`
+/// returns the on-disk spelling, which is what appears under
+/// `toolchains/llvm/prebuilt/`.
+pub const HostTag = enum {
+    /// `linux-x86_64`.
+    linux_x86_64,
+    /// `darwin-x86_64`. The only macOS package; runs on Apple Silicon under
+    /// Rosetta, and is the tag for an `aarch64-macos` host too.
+    darwin_x86_64,
+    /// `windows-x86_64`.
+    windows_x86_64,
+
+    /// The exact directory name under `toolchains/llvm/prebuilt/`.
+    ///
+    /// Borrowed from a string literal; the caller frees nothing.
+    pub fn directoryName(self: HostTag) []const u8 {
+        return switch (self) {
+            .linux_x86_64 => "linux-x86_64",
+            .darwin_x86_64 => "darwin-x86_64",
+            .windows_x86_64 => "windows-x86_64",
+        };
+    }
+};
+
+/// A resolved Android NDK installation: a borrowed view of a directory tree.
+///
+/// Ownership is the whole point of this type, so it is worth stating plainly.
+/// An `Ndk` owns no memory and has deliberately no `deinit`. Every slice it
+/// stores was allocated from the allocator the caller passed to `find` or
+/// `open`; in a build script that is the build runner's allocator, whose
+/// lifetime is the build. There is no `deinit` so that a caller cannot be led
+/// to believe the value owns anything it might leak, and so that a caller who
+/// needs a path after the build knows to copy it into storage it owns. Freeing
+/// is the allocator's business, not this type's.
+pub const Ndk = struct {
+    /// The directory that actually holds `source.properties`, `meta/` and
+    /// `toolchains/`, after the `Shape` relocation. Absolute.
+    root_path: []const u8,
+    /// The host tag whose prebuilt toolchain `sysroot_path` points into.
+    host_tag: HostTag,
+    /// `<root_path>/toolchains/llvm/prebuilt/<host_tag>/sysroot`. Absolute, and
+    /// the directory to hand a libc paths file as `include_dir` and `crt_dir`.
+    sysroot_path: []const u8,
+    /// Which of the two recognised layouts `root_path` was found under.
+    shape: Shape,
+
+    /// The two on-disk shapes an NDK is found in.
+    pub const Shape = enum {
+        /// The NDK sits where it was pointed at. The sysroot is
+        /// `<root>/toolchains/llvm/prebuilt/<host-tag>/sysroot`, and that is
+        /// what a candidate path is assumed to be before anything is probed.
+        /// This is the layout Google's own archive has once unpacked.
+        direct,
+        /// The NDK sits one level down, under
+        /// `<root>/libexec/android-sdk/ndk-bundle`, which is where a packaging
+        /// wrapper puts it. The outer directory then holds only `bin/` and
+        /// `libexec/`, and no NDK at all. This is the layout nixpkgs'
+        /// `androidenv` produces, so it is the layout a Nix user actually has.
+        ndk_bundle,
+    };
+
+    /// Every path discovery probes under one candidate root, in probe order.
+    ///
+    /// CONTRACT.md D3 promises that a refusal names every path it tried, and
+    /// this is what carries that promise. The shape of the answer follows from
+    /// three facts about the problem.
+    ///
+    /// The `Ndk` that holds those paths is only ever constructed on success, so
+    /// the information cannot ride along on it: on the failure path there is no
+    /// `Ndk`. It has to be re-derived from `(root, host)` alone, and this is
+    /// that derivation.
+    ///
+    /// It is a value the caller asks for rather than an out-parameter written
+    /// through `find` and `open`. An out-parameter was the other candidate and
+    /// it loses three ways. It changes two published signatures for a value that
+    /// is wanted only on the branch where the call has already failed. It has to
+    /// be typed for one root while D3's promise is about the *walk*, which is up
+    /// to four roots — so it would need a second concept alongside the layouts
+    /// for the roots that were skipped, and that is the half a caller needs most
+    /// when an inherited `ANDROID_NDK_HOME` outranked a local checkout. And an
+    /// out-parameter is written before the call and read after the error, so
+    /// nothing at the signature says its value is meaningful on one branch only.
+    ///
+    /// Every slice is allocated from `gpa`; `deinit` releases them. That makes
+    /// this the one value in this file that owns its paths, and the asymmetry
+    /// with `Ndk` is deliberate: an `Ndk` is only ever constructed on success
+    /// and so can afford to own nothing, whereas this exists only to be freed on
+    /// the failure branch.
+    pub const Probes = struct {
+        /// The host tag the sysroot paths were built for. A refusal that names
+        /// paths without naming the tag leaves the reader to guess which
+        /// toolchain was looked for, and a wrong host tag is one of the reasons
+        /// a probe fails.
+        host_tag: HostTag,
+        /// The two layouts, direct first. Sized by the probe itself, so a layout
+        /// cannot be added to discovery and left out of what this reports.
+        entries: [probe_shapes.len]Entry,
+
+        /// One layout's answer for one root: where the NDK would sit, and the
+        /// sysroot beneath it that discovery looks for.
+        pub const Entry = struct {
+            /// Which layout this entry describes.
+            shape: Shape,
+            /// The directory that would hold `source.properties` and
+            /// `toolchains/` under this layout: `root`, or
+            /// `root/libexec/android-sdk/ndk-bundle`.
+            ndk_root: []const u8,
+            /// `<ndk_root>/toolchains/llvm/prebuilt/<host-tag>/sysroot`, the path
+            /// whose presence decides this layout.
+            sysroot: []const u8,
+
+            /// Frees both borrowed paths.
+            pub fn deinit(self: *Entry, gpa: Allocator) void {
+                gpa.free(self.sysroot);
+                gpa.free(self.ndk_root);
+                self.* = undefined;
+            }
+        };
+
+        /// Frees every entry's paths.
+        pub fn deinit(self: *Probes, gpa: Allocator) void {
+            for (&self.entries) |*entry| entry.deinit(gpa);
+            self.* = undefined;
+        }
+    };
+
+    /// The paths discovery probes under `root` for `host`, in probe order.
+    ///
+    /// Built by the same code `open` probes with, so the diagnostic cannot name
+    /// a path that was never tried. It answers for a root that is not on disk as
+    /// readily as for one that is:
+    ///
+    /// - a root that is on disk is canonicalised exactly as `open` canonicalises
+    ///   it, so the paths reported are the paths probed, down to a symlinked
+    ///   parent or a trailing separator;
+    /// - a root that is not on disk has no canonical spelling to report, so
+    ///   `root` is used as the caller wrote it and the two entries are the paths
+    ///   that *would* have been probed. A diagnostic that refused to describe an
+    ///   absent root would leave the commonest `-Dndk` mistake undescribed.
+    ///
+    /// `host` is the tag the paths are built for, not necessarily the one this
+    /// machine resolves to. Pass what `open` was given; naming a different tag
+    /// here describes a toolchain the caller never asked for, which is the
+    /// confusion `error.UnsupportedHost` exists to prevent.
+    ///
+    /// Every slice in the result comes from `gpa`; free it with
+    /// `Probes.deinit`.
+    pub fn probeCandidates(
+        gpa: Allocator,
+        io: Io,
+        root: []const u8,
+        host: HostTag,
+    ) (Allocator.Error || FsError)!Probes {
+        const root_abs = Dir.cwd().realPathFileAlloc(io, root, gpa) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => try gpa.dupe(u8, root),
+            else => |other| return other,
+        };
+        defer gpa.free(root_abs);
+
+        var probes: Probes = .{ .host_tag = host, .entries = undefined };
+        var filled: usize = 0;
+        errdefer for (probes.entries[0..filled]) |*entry| entry.deinit(gpa);
+
+        for (probe_shapes, 0..) |shape, i| {
+            probes.entries[i] = try probeEntry(gpa, root_abs, host, shape);
+            filled += 1;
+        }
+        return probes;
+    }
+
+    /// Writes a refusal naming the host tag and every path `open` probed under
+    /// `root` into `writer`.
+    ///
+    /// This is the caller-facing half of D3's promise. `open` and `find` return
+    /// the closed `Error` set and nothing else, so what they probed has to be
+    /// asked for separately — and a caller who has to name those paths should
+    /// not have to re-spell the two layouts to do it, because a second copy of
+    /// that table is a second thing to get wrong. Use it where `NotAnNdk` is
+    /// caught:
+    ///
+    /// ```zig
+    /// const install = Ndk.open(gpa, io, root, host) catch |err| {
+    ///     if (err == error.NotAnNdk) {
+    ///         try Ndk.describeProbeFailure(gpa, io, root, host, &log);
+    ///     }
+    ///     return err;
+    /// };
+    /// ```
+    ///
+    /// A writer, not a `[]u8` the caller has to free: the caller already owns the
+    /// sink it wants the message in — a `std.Build.Step.Fail` body, a log, an
+    /// `ArrayList` — and returning a fresh allocation would mean a second
+    /// thing to release on a path that is already unwinding, and a copy to reach
+    /// the sink anyway. The only error this can add to a caller's set is
+    /// `Writer.Error`, which the sink it was handed can already produce.
+    ///
+    /// Nothing here decides whether a path is an NDK. It touches the filesystem
+    /// once, to canonicalise `root` if `root` is there at all, and then only
+    /// composes strings, so it cannot itself become the failure the caller is
+    /// reporting.
+    pub fn describeProbeFailure(
+        gpa: Allocator,
+        io: Io,
+        root: []const u8,
+        host: HostTag,
+        writer: *Writer,
+    ) (Allocator.Error || FsError || Writer.Error)!void {
+        var probes = try probeCandidates(gpa, io, root, host);
+        defer probes.deinit(gpa);
+
+        try writer.print(
+            \\no Android NDK sysroot under '{s}' for host tag '{s}'.
+            \\
+            \\discovery probes these paths, in this order, and takes the first one
+            \\that is a directory:
+            \\
+        , .{ root, probes.host_tag.directoryName() });
+
+        for (probes.entries, 0..) |entry, i| {
+            try writer.print(
+                \\
+                \\  {d}. {s}: {s}
+            , .{ i + 1, @tagName(entry.shape), entry.sysroot });
+        }
+
+        try writer.writeAll(
+            \\
+            \\none of them is. Point the NDK at an unpacked installation: the directory
+            \\holding source.properties and toolchains/. A zip file, an Android SDK root,
+            \\and an NDK unpacked for another host tag all fail exactly this way.
+            \\
+        );
+    }
+
+    /// Resolves an NDK by probing, in order: the explicit build option, then
+    /// `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK`.
+    ///
+    /// `explicit` is the caller's `-Dndk` build option; pass `null` when it was
+    /// not set. `environ` is the build runner's environment map. The first
+    /// candidate that exists wins and later candidates are never read, so an
+    /// inherited `ANDROID_NDK_HOME` does silently outrank a local checkout;
+    /// `shape` on the result tells a caller which layout answered, which is
+    /// what to name when that inherited variable picked the wrong NDK. An
+    /// unset variable is skipped without complaint.
+    ///
+    /// Returns `error.NdkNotFound` when no candidate was set or none of the set
+    /// ones is on disk, `error.NotAnNdk` when one exists but holds no sysroot,
+    /// and `error.UnsupportedHost` before any candidate is read when this
+    /// machine has no NDK host tag.
+    ///
+    /// The four candidates in the documented order are the caller's to name,
+    /// because they come from a `-D` option and an environment map that are
+    /// both the caller's. `probeCandidates` names what was probed under any one
+    /// of them, so a refusal can carry both halves of D3's list: the sources
+    /// walked, in order, and the paths each was walked for.
+    ///
+    /// The host tag comes from the compilation target, `builtin.target`, which
+    /// is the machine `zig build` runs on. Every slice the result stores comes
+    /// from `gpa`; see the ownership note on `Ndk`.
+    pub fn find(
+        gpa: Allocator,
+        io: Io,
+        explicit: ?[]const u8,
+        environ: *const Environ.Map,
+    ) (Error || Allocator.Error || FsError)!Ndk {
+        const host = try hostTag(builtin.target);
+
+        const candidates = [4]?[]const u8{
+            explicit,
+            environ.get("ANDROID_NDK_HOME"),
+            environ.get("ANDROID_NDK_ROOT"),
+            environ.get("ANDROID_NDK"),
+        };
+
+        for (candidates) |candidate| {
+            const candidate_path = candidate orelse continue;
+            if (resolve(gpa, io, candidate_path, host)) |resolved| {
+                return resolved;
+            } else |err| switch (err) {
+                // Nothing at that path at all, so the next candidate gets its
+                // turn. Anything else is a decision the caller needs to see.
+                error.FileNotFound => {},
+                else => |other| return other,
+            }
+        }
+        return error.NdkNotFound;
+    }
+
+    /// Opens an NDK whose root the caller already knows.
+    ///
+    /// `root` may be relative or absolute and is canonicalised before use, so
+    /// `sysroot()` is absolute whatever the caller passed. Both recognised
+    /// layouts are probed under it, direct first; `shape` reports which one
+    /// matched.
+    ///
+    /// Returns `error.NotAnNdk` when the root is missing, is a regular file, or
+    /// holds no sysroot directory under either layout — so pointing at an
+    /// archive, at a zip, or at an SDK root fails here rather than at link time,
+    /// and never hands back a raw filesystem error for a case the caller can act
+    /// on. `probeCandidates` and `describeProbeFailure` name the paths that were
+    /// probed, for any of those three.
+    ///
+    /// Every slice the result stores comes from `gpa`; see the ownership note
+    /// on `Ndk`.
+    pub fn open(
+        gpa: Allocator,
+        io: Io,
+        root: []const u8,
+        host: HostTag,
+    ) (Error || Allocator.Error || FsError)!Ndk {
+        return resolve(gpa, io, root, host) catch |err| switch (err) {
+            // `NotDir` is the shape a regular file takes when something walks
+            // under it, and pointing at an unzipped archive is exactly that
+            // mistake. `isDirectoryPath` absorbs it at the probe, so this arm
+            // guards the mapping rather than being reached today: if a later
+            // step under `root` walks a component, discovery still answers in
+            // its own vocabulary instead of handing back a syscall code the
+            // caller cannot act on.
+            error.FileNotFound, error.NotDir, error.NotAnNdk => error.NotAnNdk,
+            else => |other| return other,
+        };
+    }
+
+    /// The absolute sysroot directory for the resolved host tag.
+    ///
+    /// `<root_path>/toolchains/llvm/prebuilt/<host_tag.directoryName()>/sysroot`,
+    /// holding both `usr/include` and `usr/lib/<triple>/<api-level>`. This is
+    /// the one path a consumer needs to build a libc paths file from.
+    ///
+    /// Borrowed from the allocator passed to `find` or `open`; see the ownership
+    /// note on `Ndk`.
+    pub fn sysroot(self: Ndk) []const u8 {
+        return self.sysroot_path;
+    }
+
+    /// The NDK host tag that ships a prebuilt toolchain for `target`.
+    ///
+    /// `target` is the host the build runs on, normally `b.graph.host`. Google
+    /// publishes exactly three NDK packages and all three are x86_64, so this
+    /// resolves for an x86_64 Linux, macOS or Windows host and for nothing
+    /// else. `aarch64-macos` is served by the `darwin_x86_64` package, which
+    /// runs under Rosetta; `aarch64-linux` is not served at all.
+    ///
+    /// Returns `error.UnsupportedHost` for every other host. That error means
+    /// Google publishes no NDK for the machine the build is running on. It does
+    /// not mean a path was mistyped, and no `-Dndk` value can fix it: the
+    /// caller has to build on one of the three published hosts, or cross the
+    /// NDK toolchain by hand. Reporting `error.NotAnNdk` here instead would
+    /// blame the user for a path they configured correctly.
+    pub fn hostTag(target: Target) Error!HostTag {
+        return switch (target.os.tag) {
+            // Only x86_64 has a package. A native Apple Silicon build still
+            // uses the darwin-x86_64 package, so that is the tag for both.
+            .linux => if (target.cpu.arch == .x86_64)
+                .linux_x86_64
+            else
+                error.UnsupportedHost,
+            .macos => if (target.cpu.arch == .x86_64 or target.cpu.arch == .aarch64)
+                .darwin_x86_64
+            else
+                error.UnsupportedHost,
+            .windows => if (target.cpu.arch == .x86_64)
+                .windows_x86_64
+            else
+                error.UnsupportedHost,
+            else => error.UnsupportedHost,
+        };
+    }
+
+    /// The sysroot triple for `abi`, the directory name under `usr/lib`.
+    ///
+    /// Borrowed from a string literal; see `Abi.triple`.
+    pub fn tripleFor(abi: Abi) []const u8 {
+        return abi.triple();
+    }
+
+    /// The API-level directory holding this ABI's CRT objects and its libc and
+    /// libm shared objects.
+    ///
+    /// `<sysroot>/usr/lib/<abi.triple()>/<api_level>`, absolute. In r29 this
+    /// directory holds the six CRT objects — `crtbegin_dynamic.o`,
+    /// `crtbegin_so.o`, `crtbegin_static.o`, `crtend_android.o`,
+    /// `crtend_so.o` and `crt_pad_segment.o` — beside `libc.so`, `libm.so` and
+    /// the `libc++.so` / `libc++.a` linker scripts, so it is the value a libc
+    /// paths file wants as `crt_dir`. It is never the API-agnostic
+    /// `usr/lib/<triple>`, and it never holds `libc.a` or `libc++_shared.so`.
+    ///
+    /// That placement is the load-bearing consequence, and it is why a
+    /// consumer must set `.linkage = .dynamic`: `libc.a` and
+    /// `libc++_shared.so` are API-agnostic and sit one level up, as siblings of
+    /// the numeric directories in `usr/lib/<triple>`. A libc paths file carries
+    /// no other search path, so neither archive is reachable from the `crt_dir`
+    /// this returns. A static libc link and a libc++ link are therefore not
+    /// reachable from `crt_dir` alone, and a consumer wanting one has to name
+    /// the archive itself.
+    ///
+    /// Returns `error.UnsupportedAbi` when the NDK has no `usr/lib/<triple>` at
+    /// all, and `error.ApiLevelUnavailable` when it has the triple but not that
+    /// level. `apiLevelsFor` answers both questions without failing.
+    ///
+    /// The returned slice is owned by `gpa`; free it with the same allocator.
+    pub fn libcDirFor(
+        self: Ndk,
+        gpa: Allocator,
+        io: Io,
+        abi: Abi,
+        api_level: u32,
+    ) (Error || Allocator.Error || FsError)![]u8 {
+        const triple_dir = try self.tripleDir(gpa, io, abi);
+        defer gpa.free(triple_dir);
+
+        // A u32 needs at most ten digits, so this buffer cannot overflow.
+        // printInt cannot fail; bufPrint would widen the error set of this
+        // function with an error that cannot happen.
+        var api_buf: [10]u8 = undefined;
+        const api_end = std.fmt.printInt(&api_buf, api_level, 10, .lower, .{});
+        const api_text = api_buf[0..api_end];
+
+        const level_dir = try path.join(gpa, &.{ triple_dir, api_text });
+        errdefer gpa.free(level_dir);
+
+        // A plain file named like an API level is not an API level, and handing
+        // one to a libc paths file as `crt_dir` fails at link time with a
+        // message about libc that points nowhere near the file.
+        if (!try isDirectoryPath(io, level_dir)) return error.ApiLevelUnavailable;
+
+        return level_dir;
+    }
+
+    /// Every API level this NDK ships a CRT-object directory for.
+    ///
+    /// Reads the numeric directory names directly under
+    /// `<sysroot>/usr/lib/<abi.triple()>` and returns them sorted ascending.
+    /// Entries whose name does not parse as an unsigned decimal are skipped, so
+    /// a future NDK that adds a directory beside the API levels cannot break
+    /// this.
+    ///
+    /// Returns `error.UnsupportedAbi` when the NDK has no `usr/lib/<triple>` at
+    /// all.
+    ///
+    /// The returned slice is owned by `gpa`; free it with the same allocator.
+    pub fn apiLevelsFor(
+        self: Ndk,
+        gpa: Allocator,
+        io: Io,
+        abi: Abi,
+    ) (Error || Allocator.Error || FsError)![]u32 {
+        const triple_dir = try self.tripleDir(gpa, io, abi);
+        defer gpa.free(triple_dir);
+
+        var dir = Dir.openDirAbsolute(io, triple_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return error.UnsupportedAbi,
+            else => |other| return other,
+        };
+        defer dir.close(io);
+
+        var levels: std.ArrayList(u32) = .empty;
+        errdefer levels.deinit(gpa);
+
+        var entries = dir.iterate();
+        while (try entries.next(io)) |entry| {
+            // The same predicate `libcDirFor` uses, so a name the iterator calls
+            // a directory and a stat calls one cannot disagree.
+            if (!isDirectory(entry.kind)) continue;
+            const level = std.fmt.parseUnsigned(u32, entry.name, 10) catch continue;
+            try levels.append(gpa, level);
+        }
+
+        std.mem.sort(u32, levels.items, {}, std.sort.asc(u32));
+        return levels.toOwnedSlice(gpa);
+    }
+
+    /// Reads the `Pkg.Revision` code from `source.properties` at the NDK root.
+    ///
+    /// `null` when the file is absent, which is legal: a repackaged NDK need
+    /// not carry one, and an unknown version never blocks a build.
+    /// `error.VersionUnreadable` when it is present but holds no parsable
+    /// `Pkg.Revision` line. Everything else is a filesystem error.
+    ///
+    /// This is the dotted code, `29.0.14206865`, which is what a build pins
+    /// against. The sibling `Pkg.ReleaseName`, `r29`, is the string a human
+    /// reads; this does not return it.
+    pub fn readVersion(
+        self: Ndk,
+        gpa: Allocator,
+        io: Io,
+    ) (Error || Allocator.Error || FsError)!?Version {
+        var dir = Dir.openDirAbsolute(io, self.root_path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return error.NotAnNdk,
+            else => |other| return other,
+        };
+        defer dir.close(io);
+
+        const properties = dir.readFileAlloc(
+            io,
+            "source.properties",
+            gpa,
+            .limited(max_properties_bytes),
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => |other| return other,
+        };
+        defer gpa.free(properties);
+
+        return try Version.parse(properties);
+    }
+
+    /// The dotted version code from `Pkg.Revision`, `29.0.14206865` for r29.
+    ///
+    /// r29 writes both `Pkg.Revision = 29.0.14206865` and an identical
+    /// `Pkg.BaseRevision`; only the first is read. A value type: it owns no
+    /// memory and has no `deinit`.
+    pub const Version = struct {
+        /// The release number. `29` for r29.
+        major: u32,
+        /// The second component. `0` for r29.
+        minor: u32,
+        /// The build number. `14206865` for r29.
+        patch: u32,
+
+        /// Parses the `Pkg.Revision` value out of a `source.properties` body.
+        ///
+        /// Scans whole lines, skipping blanks, `#` comments and every other
+        /// key, and returns the first `Pkg.Revision` whose value is three
+        /// dot-separated non-negative integers. Whitespace around the key, the
+        /// `=` and the value is ignored. No such key, two components, a
+        /// trailing qualifier or anything unparsable is
+        /// `error.VersionUnreadable`, never a guess.
+        pub fn parse(properties: []const u8) Error!Version {
+            var lines = std.mem.tokenizeScalar(u8, properties, '\n');
+            while (lines.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+                const separator = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+                const key = std.mem.trim(u8, trimmed[0..separator], " \t");
+                if (!std.mem.eql(u8, key, "Pkg.Revision")) continue;
+
+                return parseRevision(std.mem.trim(u8, trimmed[separator + 1 ..], " \t"));
+            }
+            return error.VersionUnreadable;
+        }
+    };
+
+    /// `<sysroot>/usr/lib/<abi.triple()>`, checked to be a directory. Gpa-owned.
+    ///
+    /// `error.UnsupportedAbi` when it is not there or is not a directory, which
+    /// is how an ABI this NDK does not carry is told apart from an API level it
+    /// does not.
+    fn tripleDir(
+        self: Ndk,
+        gpa: Allocator,
+        io: Io,
+        abi: Abi,
+    ) (Error || Allocator.Error || FsError)![]u8 {
+        const triple_dir = try path.join(gpa, &.{
+            self.sysroot_path, "usr", "lib", abi.triple(),
+        });
+        errdefer gpa.free(triple_dir);
+
+        if (!try isDirectoryPath(io, triple_dir)) return error.UnsupportedAbi;
+
+        return triple_dir;
+    }
+};
+
+/// The one definition of "this is a directory" this module uses.
+///
+/// Two questions get the same answer — the `stat` a probe does, and the `kind`
+/// a directory iterator hands back — and `File.Kind` is the type both carry, so
+/// there is one place to be wrong. That matters because the two were once
+/// spelled separately: `apiLevelsFor` filtered iterator entries on
+/// `entry.kind == .directory` while `libcDirFor` asked only whether a path
+/// existed. A plain file named `99` under `usr/lib/<triple>/` was then correctly
+/// left out of `apiLevelsFor` and happily accepted as a `crt_dir`, and the build
+/// failed later, at link time, with a message about libc that pointed nowhere
+/// near the file that caused it.
+fn isDirectory(kind: File.Kind) bool {
+    return kind == .directory;
+}
+
+/// Whether `dir_path` is a directory.
+///
+/// "Not there" and "there but not a directory" are both `false`, because for
+/// every caller here — a sysroot, a `usr/lib/<triple>`, an API-level directory —
+/// a path that is not a directory is the wrong shape rather than a broken
+/// machine, and "not a directory" is exactly what pointing at a zip, at an SDK
+/// root, or at a wrapper's outer directory looks like on disk.
+///
+/// Every other filesystem error is returned unchanged, and that is the point of
+/// the second half of the switch: a caller here maps `false` onto a domain
+/// answer that depends on what it was looking for (the wrong `Shape`,
+/// `UnsupportedAbi`, `ApiLevelUnavailable`), so reading a permission failure or
+/// an I/O error as "absent" would turn a broken filesystem into a confident
+/// wrong answer about the NDK.
+fn isDirectoryPath(io: Io, dir_path: []const u8) FsError!bool {
+    const stat = Dir.cwd().statFile(io, dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => |other| return other,
+    };
+    return isDirectory(stat.kind);
+}
+
+/// The layouts discovery recognises under one candidate root, in probe order.
+///
+/// Direct first, because that is what an explicitly named root means and
+/// because a packaging wrapper is the rarer case. `Ndk.Probes` sizes its entry
+/// array by this length, so a layout cannot be added to the probe and left out
+/// of what a refusal reports.
+const probe_shapes = [_]Ndk.Shape{ .direct, .ndk_bundle };
+
+/// The NDK root and the sysroot one layout implies under an absolute `root`.
+/// Gpa-owned; free both slices through `Probes.Entry.deinit`.
+///
+/// The one place the two layouts are spelled out as paths. `resolve` probes what
+/// this builds and `Ndk.probeCandidates` reports it, so the paths a refusal
+/// names are the paths the refusal came from — a diagnostic cannot drift away
+/// from the discovery it describes, which is where a message written out twice
+/// eventually ends up pointing somewhere the code never looked.
+fn probeEntry(
+    gpa: Allocator,
+    root_abs: []const u8,
+    host: HostTag,
+    shape: Ndk.Shape,
+) Allocator.Error!Ndk.Probes.Entry {
+    const ndk_root = switch (shape) {
+        .direct => try gpa.dupe(u8, root_abs),
+        .ndk_bundle => try path.join(gpa, &.{
+            root_abs, "libexec", "android-sdk", "ndk-bundle",
+        }),
+    };
+    errdefer gpa.free(ndk_root);
+
+    const sysroot = try path.join(gpa, &.{
+        ndk_root,
+        "toolchains",
+        "llvm",
+        "prebuilt",
+        host.directoryName(),
+        "sysroot",
+    });
+    errdefer gpa.free(sysroot);
+
+    return .{ .shape = shape, .ndk_root = ndk_root, .sysroot = sysroot };
+}
+
+/// Resolves one candidate root under both recognised layouts.
+///
+/// Private, so that `Ndk.find` can tell "this candidate is not on disk, try the
+/// next one" apart from "this candidate exists and is not an NDK", which is the
+/// distinction `error.FileNotFound` and `error.NotAnNdk` carry. That is also why
+/// the canonicalisation here is not the one in `Ndk.probeCandidates`: in the
+/// walk an absent root must stay distinguishable from a root that is present and
+/// wrong, because there is a next candidate to fall through to.
+fn resolve(
+    gpa: Allocator,
+    io: Io,
+    root: []const u8,
+    host: HostTag,
+) (Error || Allocator.Error || FsError)!Ndk {
+    const canonical = Dir.cwd().realPathFileAlloc(io, root, gpa) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        error.NotDir => return error.NotAnNdk,
+        else => |other| return other,
+    };
+    defer gpa.free(canonical);
+    // realPathFileAlloc hands back a sentinel slice; nothing here needs the
+    // sentinel and every path.join below wants a plain slice.
+    const root_abs: []const u8 = canonical;
+
+    for (probe_shapes) |shape| {
+        var entry = try probeEntry(gpa, root_abs, host, shape);
+        // On the matching shape the entry's two slices become the result, so
+        // this frees them on every iteration that moves on to the next shape,
+        // and on every error return out of the body.
+        var claimed = false;
+        defer if (!claimed) entry.deinit(gpa);
+
+        // A sysroot that is not there — or is there and is not a directory —
+        // means this shape is the wrong one, so the answer is "not this shape",
+        // not "stop". Only a real filesystem failure is worth passing on.
+        if (!try isDirectoryPath(io, entry.sysroot)) continue;
+        claimed = true;
+
+        return .{
+            .root_path = entry.ndk_root,
+            .host_tag = host,
+            .sysroot_path = entry.sysroot,
+            .shape = entry.shape,
+        };
+    }
+
+    return error.NotAnNdk;
+}
+
+/// Parses `29.0.14206865` into three components, or refuses.
+fn parseRevision(text: []const u8) Error!Ndk.Version {
+    var components: [3]u32 = undefined;
+    var parts = std.mem.splitScalar(u8, text, '.');
+    for (&components) |*component| {
+        const digits = parts.next() orelse return error.VersionUnreadable;
+        component.* = std.fmt.parseUnsigned(u32, digits, 10) catch
+            return error.VersionUnreadable;
+    }
+    if (parts.next() != null) return error.VersionUnreadable;
+
+    return .{
+        .major = components[0],
+        .minor = components[1],
+        .patch = components[2],
+    };
+}
+
+const testing = std.testing;
+
+/// Resolves an `arch-os` triple string into a real `std.Target`.
+///
+/// `std.Target` cannot be written as a literal without all four of `cpu`, `os`,
+/// `abi` and `ofmt`, and `cpu.model` is a `*const Model` that has to outlive
+/// the target it belongs to, so a hand-built literal is a trap. Zig's own
+/// resolver produces a target with every field real. `hostTag` reads only the
+/// OS tag and the CPU arch; the rest is here so the value is not a fiction.
+/// Test helper.
+fn targetFor(arch_os: []const u8) !std.Target {
+    return std.zig.system.resolveTargetQuery(
+        testing.io,
+        try std.Target.Query.parse(.{ .arch_os_abi = arch_os }),
+    );
+}
+
+/// The absolute path of a scratch directory. `gpa`-owned. Test helper.
+fn absPathOf(gpa: Allocator, scratch: *testing.TmpDir) ![]u8 {
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const len = try scratch.dir.realPath(testing.io, &buf);
+    return gpa.dupe(u8, buf[0..len]);
+}
+
+/// Joins `parts` and creates the result plus every missing parent. `gpa`-owned.
+///
+/// Test helper.
+fn createAll(gpa: Allocator, parts: []const []const u8) ![]u8 {
+    const dir = try path.join(gpa, parts);
+    errdefer gpa.free(dir);
+    try Dir.cwd().createDirPath(testing.io, dir);
+    return dir;
+}
+
+/// Builds a synthetic NDK holding one triple with one directory per level.
+///
+/// Enough of a tree for `open`, `libcDirFor`, `apiLevelsFor` and `readVersion`
+/// to be exercised with no NDK anywhere on the machine. Returns the root path,
+/// `gpa`-owned. Test helper.
+fn createNdk(
+    gpa: Allocator,
+    scratch: *testing.TmpDir,
+    host: HostTag,
+    triple_name: []const u8,
+    levels: []const []const u8,
+) ![]u8 {
+    const root = try absPathOf(gpa, scratch);
+    errdefer gpa.free(root);
+
+    const lib_dir = try createAll(gpa, &.{
+        root,
+        "toolchains",
+        "llvm",
+        "prebuilt",
+        host.directoryName(),
+        "sysroot",
+        "usr",
+        "lib",
+        triple_name,
+    });
+    defer gpa.free(lib_dir);
+
+    for (levels) |level| {
+        const dir = try createAll(gpa, &.{ lib_dir, level });
+        defer gpa.free(dir);
+    }
+    return root;
+}
+
+test "ABI directory names round-trip to the names the NDK uses on disk" {
+    // Straight from r29's meta/abis.json keys. A tag is not a directory name;
+    // only this mapping reaches the on-disk spelling.
+    try testing.expectEqualStrings("armeabi-v7a", Abi.armeabi_v7a.directoryName());
+    try testing.expectEqualStrings("arm64-v8a", Abi.arm64_v8a.directoryName());
+    try testing.expectEqualStrings("riscv64", Abi.riscv64.directoryName());
+    try testing.expectEqualStrings("x86", Abi.x86.directoryName());
+    try testing.expectEqualStrings("x86_64", Abi.x86_64.directoryName());
+
+    // The enum is exactly the five r29 ABIs, and every directory name is
+    // distinct, so no two ABIs can be confused for one another on disk.
+    const abis = std.enums.values(Abi);
+    try testing.expectEqual(@as(usize, 5), abis.len);
+    for (abis, 0..) |a, i| {
+        for (abis, 0..) |b, j| {
+            if (j <= i) continue;
+            try testing.expect(!std.mem.eql(u8, a.directoryName(), b.directoryName()));
+            try testing.expect(!std.mem.eql(u8, a.triple(), b.triple()));
+        }
+    }
+
+    // The mapping is not the identity: a tag is never usable as a directory
+    // name, which is why @tagName must never be used to build a path. Only the
+    // three ABIs whose directory name has no dash can coincide with their tag.
+    for (abis) |abi| {
+        if (!std.mem.eql(u8, abi.directoryName(), @tagName(abi))) continue;
+        try testing.expect(std.mem.indexOfScalar(u8, @tagName(abi), '-') == null);
+    }
+}
+
+test "every triple matches r29's meta/abis.json" {
+    try testing.expectEqualStrings("arm-linux-androideabi", Abi.armeabi_v7a.triple());
+    try testing.expectEqualStrings("aarch64-linux-android", Abi.arm64_v8a.triple());
+    try testing.expectEqualStrings("riscv64-linux-android", Abi.riscv64.triple());
+    try testing.expectEqualStrings("i686-linux-android", Abi.x86.triple());
+    try testing.expectEqualStrings("x86_64-linux-android", Abi.x86_64.triple());
+
+    // Ndk.tripleFor is the namespaced spelling and must not drift.
+    for (std.enums.values(Abi)) |abi| {
+        try testing.expectEqualStrings(abi.triple(), Ndk.tripleFor(abi));
+    }
+}
+
+test "every minimum API level matches r29's min_os_version" {
+    try testing.expectEqual(@as(u32, 21), Abi.armeabi_v7a.minApiLevel());
+    try testing.expectEqual(@as(u32, 21), Abi.arm64_v8a.minApiLevel());
+    try testing.expectEqual(@as(u32, 35), Abi.riscv64.minApiLevel());
+    try testing.expectEqual(@as(u32, 21), Abi.x86.minApiLevel());
+    try testing.expectEqual(@as(u32, 21), Abi.x86_64.minApiLevel());
+}
+
+test "only 32-bit ARM is androideabi" {
+    try testing.expectEqual(Target.Abi.androideabi, Abi.armeabi_v7a.zigAbi());
+    try testing.expectEqual(Target.Abi.android, Abi.arm64_v8a.zigAbi());
+    try testing.expectEqual(Target.Abi.android, Abi.riscv64.zigAbi());
+    try testing.expectEqual(Target.Abi.android, Abi.x86.zigAbi());
+    try testing.expectEqual(Target.Abi.android, Abi.x86_64.zigAbi());
+
+    // Every ABI maps to an ABI Zig itself calls Android, or the dynamic linker
+    // it picks would not be a bionic one.
+    for (std.enums.values(Abi)) |abi| {
+        try testing.expect(abi.zigAbi().isAndroid());
+    }
+}
+
+test "host tags resolve for the three hosts Google publishes an NDK for" {
+    // Google's manifest offers android-ndk-r29-{linux,darwin,windows}.zip and
+    // no arm package, so these three triples are the whole supported set.
+    const cases = [_]struct { arch_os: []const u8, want: HostTag }{
+        .{ .arch_os = "x86_64-linux", .want = .linux_x86_64 },
+        .{ .arch_os = "x86_64-macos", .want = .darwin_x86_64 },
+        .{ .arch_os = "x86_64-windows", .want = .windows_x86_64 },
+    };
+    try testing.expectEqual(cases.len, std.enums.values(HostTag).len);
+
+    for (cases) |case| {
+        const target = try targetFor(case.arch_os);
+        try testing.expectEqual(case.want, try Ndk.hostTag(target));
+
+        // Every resolved host tag reaches its on-disk spelling.
+        try testing.expectEqualStrings(
+            case.want.directoryName(),
+            (try Ndk.hostTag(target)).directoryName(),
+        );
+    }
+
+    // Apple Silicon runs the darwin-x86_64 package under Rosetta, so an arm
+    // macOS host resolves rather than failing.
+    try testing.expectEqual(
+        HostTag.darwin_x86_64,
+        try Ndk.hostTag(try targetFor("aarch64-macos")),
+    );
+}
+
+test "hosts Google publishes no NDK for are refused, not misreported" {
+    // Most of these matter because a host with a plausible tag would otherwise
+    // get that tag and then fail as NotAnNdk, blaming a path that is correct.
+    const refused = [_][]const u8{
+        "aarch64-linux",
+        "riscv64-linux",
+        "x86-linux",
+        "x86-windows",
+        "aarch64-windows",
+        "riscv64-windows",
+        "x86_64-freebsd",
+        "aarch64-freebsd",
+    };
+    for (refused) |arch_os| {
+        try testing.expectError(
+            error.UnsupportedHost,
+            Ndk.hostTag(try targetFor(arch_os)),
+        );
+    }
+}
+
+test "the host tag names a prebuilt directory, not the ABI triple" {
+    try testing.expectEqualStrings("linux-x86_64", HostTag.linux_x86_64.directoryName());
+    try testing.expectEqualStrings("darwin-x86_64", HostTag.darwin_x86_64.directoryName());
+    try testing.expectEqualStrings("windows-x86_64", HostTag.windows_x86_64.directoryName());
+
+    const hosts = std.enums.values(HostTag);
+
+    // Every published host tag is an x86_64 tag. A `linux-aarch64` or
+    // `darwin-arm64` entry would be a tag no Google package contains.
+    for (hosts) |host| {
+        try testing.expect(std.mem.endsWith(u8, @tagName(host), "_x86_64"));
+    }
+
+    // No host tag collides with an ABI triple: the two name different
+    // directories, and mixing them up silently yields a missing sysroot.
+    for (hosts) |host| {
+        for (std.enums.values(Abi)) |abi| {
+            try testing.expect(!std.mem.eql(u8, host.directoryName(), abi.triple()));
+        }
+    }
+}
+
+test "r29's Pkg.Revision parses" {
+    const properties =
+        \\Pkg.Desc = Android NDK
+        \\Pkg.Revision = 29.0.14206865
+        \\Pkg.BaseRevision = 29.0.14206865
+        \\Pkg.ReleaseName = r29
+    ;
+    const version = try Ndk.Version.parse(properties);
+    try testing.expectEqual(@as(u32, 29), version.major);
+    try testing.expectEqual(@as(u32, 0), version.minor);
+    try testing.expectEqual(@as(u32, 14206865), version.patch);
+}
+
+test "version parsing tolerates spacing and rejects everything else" {
+    try testing.expectEqual(
+        @as(u32, 29),
+        (try Ndk.Version.parse("Pkg.Revision=29.0.14206865")).major,
+    );
+    try testing.expectEqual(
+        @as(u32, 14206865),
+        (try Ndk.Version.parse("  Pkg.Revision \t= \t 29.0.14206865  \r")).patch,
+    );
+
+    // A different key is not the version.
+    try testing.expectError(
+        error.VersionUnreadable,
+        Ndk.Version.parse("Pkg.ReleaseName = r29"),
+    );
+    // Neither is a truncated or over-long code.
+    try testing.expectError(error.VersionUnreadable, Ndk.Version.parse("Pkg.Revision = 29.0"));
+    try testing.expectError(
+        error.VersionUnreadable,
+        Ndk.Version.parse("Pkg.Revision = 29.0.14206865.1"),
+    );
+    try testing.expectError(
+        error.VersionUnreadable,
+        Ndk.Version.parse("Pkg.Revision = r29"),
+    );
+    // Nor is an absent or empty file.
+    try testing.expectError(error.VersionUnreadable, Ndk.Version.parse(""));
+    try testing.expectError(
+        error.VersionUnreadable,
+        Ndk.Version.parse("# Pkg.Desc = Android NDK\n"),
+    );
+}
+
+test "open resolves a direct root and reports the direct shape" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    const sysroot = try createAll(gpa, &.{
+        root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+    });
+
+    const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+    try testing.expectEqual(Ndk.Shape.direct, ndk.shape);
+    try testing.expectEqual(HostTag.linux_x86_64, ndk.host_tag);
+    try testing.expectEqualStrings(root, ndk.root_path);
+    try testing.expectEqualStrings(sysroot, ndk.sysroot());
+}
+
+test "open resolves a root that keeps the NDK one level down" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    // The shape a packaging wrapper leaves: the outer directory holds only
+    // bin/ and libexec/, and the NDK itself sits under libexec/android-sdk.
+    const sysroot = try createAll(gpa, &.{
+        root,         "libexec", "android-sdk", "ndk-bundle",
+        "toolchains", "llvm",    "prebuilt",    "linux-x86_64",
+        "sysroot",
+    });
+
+    const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+    try testing.expectEqual(Ndk.Shape.ndk_bundle, ndk.shape);
+    try testing.expectEqualStrings(sysroot, ndk.sysroot());
+
+    const bundle_root = try path.join(gpa, &.{
+        root, "libexec", "android-sdk", "ndk-bundle",
+    });
+    try testing.expectEqualStrings(bundle_root, ndk.root_path);
+}
+
+test "a direct root wins over a nested one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    const direct_sysroot = try createAll(gpa, &.{
+        root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+    });
+    const nested_sysroot = try createAll(gpa, &.{
+        root,         "libexec", "android-sdk", "ndk-bundle",
+        "toolchains", "llvm",    "prebuilt",    "linux-x86_64",
+        "sysroot",
+    });
+
+    const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+    try testing.expectEqual(Ndk.Shape.direct, ndk.shape);
+    try testing.expectEqualStrings(direct_sysroot, ndk.sysroot());
+    try testing.expect(!std.mem.eql(u8, nested_sysroot, ndk.sysroot()));
+}
+
+test "a root with no sysroot, or no root at all, is not an NDK" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    // A directory that exists and holds NDK metadata, but no toolchain.
+    _ = try createAll(gpa, &.{ root, "meta" });
+    try testing.expectError(
+        error.NotAnNdk,
+        Ndk.open(gpa, testing.io, root, .linux_x86_64),
+    );
+
+    // A path that does not exist at all.
+    const missing = try path.join(gpa, &.{ root, "not-installed" });
+    try testing.expectError(
+        error.NotAnNdk,
+        Ndk.open(gpa, testing.io, missing, .linux_x86_64),
+    );
+}
+
+test "the host tag selects which prebuilt toolchain is used" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    // Only one prebuilt directory, and it is not the one asked for.
+    const sysroot = try createAll(gpa, &.{
+        root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+    });
+
+    // The right host, pointed at the wrong installation.
+    try testing.expectError(
+        error.NotAnNdk,
+        Ndk.open(gpa, testing.io, root, .darwin_x86_64),
+    );
+
+    const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+    try testing.expectEqualStrings(sysroot, ndk.sysroot());
+}
+
+test "API levels come back sorted and libcDirFor finds each one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    const triple_dir = try createAll(gpa, &.{
+        root,  "toolchains", "llvm",                  "prebuilt", "linux-x86_64", "sysroot",
+        "usr", "lib",        "aarch64-linux-android",
+    });
+
+    // Out of order on purpose, and beside a name that is not an API level.
+    for ([_][]const u8{ "35", "21", "30", "debug" }) |level| {
+        _ = try createAll(gpa, &.{ triple_dir, level });
+    }
+
+    const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+
+    const levels = try ndk.apiLevelsFor(gpa, testing.io, .arm64_v8a);
+    try testing.expectEqualSlices(u32, &.{ 21, 30, 35 }, levels);
+
+    const crt_dir = try ndk.libcDirFor(gpa, testing.io, .arm64_v8a, 35);
+    const expected = try path.join(gpa, &.{ triple_dir, "35" });
+    try testing.expectEqualStrings(expected, crt_dir);
+
+    // The triple is shipped, the level is not.
+    try testing.expectError(
+        error.ApiLevelUnavailable,
+        ndk.libcDirFor(gpa, testing.io, .arm64_v8a, 34),
+    );
+    // Neither is the triple.
+    try testing.expectError(
+        error.UnsupportedAbi,
+        ndk.libcDirFor(gpa, testing.io, .riscv64, 35),
+    );
+    try testing.expectError(
+        error.UnsupportedAbi,
+        ndk.apiLevelsFor(gpa, testing.io, .x86),
+    );
+}
+
+test "readVersion reads the code, tolerates absence, refuses junk" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    _ = try createAll(gpa, &.{
+        root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+    });
+
+    const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+
+    // No source.properties at all is legal and leaves the version unknown.
+    try testing.expect(try ndk.readVersion(gpa, testing.io) == null);
+
+    try scratch.dir.writeFile(testing.io, .{
+        .sub_path = "source.properties",
+        .data = "Pkg.Desc = Android NDK\nPkg.Revision = 29.0.14206865\n",
+    });
+    const version = (try ndk.readVersion(gpa, testing.io)).?;
+    try testing.expectEqual(@as(u32, 29), version.major);
+    try testing.expectEqual(@as(u32, 0), version.minor);
+    try testing.expectEqual(@as(u32, 14206865), version.patch);
+
+    // Present but unparsable is an error, not a silent null.
+    try scratch.dir.writeFile(testing.io, .{
+        .sub_path = "source.properties",
+        .data = "Pkg.ReleaseName = r29\n",
+    });
+    try testing.expectError(
+        error.VersionUnreadable,
+        ndk.readVersion(gpa, testing.io),
+    );
+}
+
+test "find takes the build option first, then the variables in order" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    // `find` resolves the host tag from the compilation target, so on a host
+    // Google publishes no NDK package for there is no order to assert. That
+    // case is not skipped silently — it asserts the refusal in its place, and
+    // that is precisely what these hosts otherwise never exercise. "This host
+    // has no package" and "the path you configured is wrong" are different
+    // problems with different fixes.
+    const host = Ndk.hostTag(builtin.target) catch |err| switch (err) {
+        error.UnsupportedHost => {
+            var empty: Environ.Map = .init(testing.allocator);
+            defer empty.deinit();
+            try testing.expectError(
+                error.UnsupportedHost,
+                Ndk.find(gpa, testing.io, null, &empty),
+            );
+            return;
+        },
+        // `hostTag` takes a target and consults no directory, so the NDK-domain
+        // refusals in its error set are unreachable here. The arm exists only
+        // because the set is closed and a bare `catch` would drop the others
+        // silently.
+        else => unreachable,
+    };
+
+    var option_scratch = testing.tmpDir(.{});
+    defer option_scratch.cleanup();
+    const option_root = try createNdk(
+        gpa,
+        &option_scratch,
+        host,
+        "riscv64-linux-android",
+        &.{},
+    );
+
+    var env_scratch = testing.tmpDir(.{});
+    defer env_scratch.cleanup();
+    const env_root = try createNdk(
+        gpa,
+        &env_scratch,
+        host,
+        "i686-linux-android",
+        &.{"21"},
+    );
+
+    var dead_scratch = testing.tmpDir(.{});
+    defer dead_scratch.cleanup();
+    const dead_root = try absPathOf(gpa, &dead_scratch);
+    const missing = try path.join(gpa, &.{ dead_root, "gone" });
+
+    var environ: Environ.Map = .init(testing.allocator);
+    defer environ.deinit();
+    try environ.put("ANDROID_NDK_HOME", env_root);
+    try environ.put("ANDROID_NDK_ROOT", env_root);
+    try environ.put("ANDROID_NDK", env_root);
+
+    // An explicit option outranks every variable.
+    {
+        const ndk = try Ndk.find(gpa, testing.io, option_root, &environ);
+        try testing.expectEqualStrings(option_root, ndk.root_path);
+    }
+    // Without one, the variables are consulted in the documented order.
+    {
+        const ndk = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(env_root, ndk.root_path);
+    }
+    // A candidate that is not on disk is skipped for the next one.
+    {
+        try environ.put("ANDROID_NDK_HOME", missing);
+        const ndk = try Ndk.find(gpa, testing.io, missing, &environ);
+        try testing.expectEqualStrings(env_root, ndk.root_path);
+    }
+    // An existing directory that is not an NDK stops discovery, so the mistake
+    // is reported instead of silently falling through to a worse answer.
+    {
+        try environ.put("ANDROID_NDK_HOME", dead_root);
+        try testing.expectError(
+            error.NotAnNdk,
+            Ndk.find(gpa, testing.io, null, &environ),
+        );
+    }
+    // Nothing set, and everything set but absent, are discovery failures.
+    {
+        var empty: Environ.Map = .init(testing.allocator);
+        defer empty.deinit();
+        try testing.expectError(
+            error.NdkNotFound,
+            Ndk.find(gpa, testing.io, null, &empty),
+        );
+
+        try environ.put("ANDROID_NDK_HOME", missing);
+        try environ.put("ANDROID_NDK_ROOT", missing);
+        try environ.put("ANDROID_NDK", missing);
+        try testing.expectError(
+            error.NdkNotFound,
+            Ndk.find(gpa, testing.io, null, &environ),
+        );
+    }
+}
+
+/// Renders the refusal `Ndk.describeProbeFailure` writes, as one string.
+/// `testing`-allocator-owned; the caller frees it. Test helper.
+///
+/// `testing.allocator` and not the arena, so a renderer that stops copying what
+/// it was handed fails the leak check instead of passing unnoticed.
+fn probeMessage(root: []const u8, host: HostTag) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try Ndk.describeProbeFailure(
+        arena.allocator(),
+        testing.io,
+        root,
+        host,
+        &out.writer,
+    );
+    return testing.allocator.dupe(u8, out.written());
+}
+
+/// Writes a plain file at the absolute path `file_path`. Test helper.
+///
+/// The point of it is a file where a directory is expected: `createAll` cannot
+/// make one, and a refusal of `error.FileNotFound` proves nothing about a path
+/// that is present and is simply the wrong kind of thing.
+///
+/// Absolute, because the trees are built through `Dir.cwd` from the canonical
+/// spelling `absPathOf` returns, and a tmp dir handle may hold a different
+/// spelling of the same directory — through a symlink in `TMPDIR`, say — in
+/// which case a path spelled relatively to the handle names a different tree.
+fn createFile(file_path: []const u8, data: []const u8) !void {
+    try Dir.cwd().writeFile(testing.io, .{ .sub_path = file_path, .data = data });
+}
+
+test "a refusal names both probed layouts and the host tag" {
+    // The defect this catches: D3 promises the refusal names every path it
+    // tried, and `open` returned the bare `error.NotAnNdk`. A user who pointed
+    // `-Dndk` at an SDK root then had to guess which of two layouts was
+    // expected, and the two are not guesses a user can make.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    // Exists, holds NDK metadata, holds no toolchain: the case D3 is about.
+    _ = try createAll(gpa, &.{ root, "meta" });
+    try testing.expectError(
+        error.NotAnNdk,
+        Ndk.open(gpa, testing.io, root, .linux_x86_64),
+    );
+
+    const message = try probeMessage(root, .linux_x86_64);
+    defer testing.allocator.free(message);
+
+    // Both layouts, named, in probe order.
+    const direct_at = std.mem.indexOf(u8, message, "direct:").?;
+    const bundle_at = std.mem.indexOf(u8, message, "ndk_bundle:").?;
+    try testing.expect(direct_at < bundle_at);
+
+    // Both sysroot paths, spelled the way discovery spells them.
+    const direct_sysroot = try path.join(gpa, &.{
+        root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+    });
+    const bundle_sysroot = try path.join(gpa, &.{
+        root,         "libexec", "android-sdk", "ndk-bundle",
+        "toolchains", "llvm",    "prebuilt",    "linux-x86_64",
+        "sysroot",
+    });
+    try testing.expect(std.mem.indexOf(u8, message, direct_sysroot) != null);
+    try testing.expect(std.mem.indexOf(u8, message, bundle_sysroot) != null);
+
+    // And the host tag, without which the paths say nothing about which
+    // toolchain was looked for.
+    try testing.expect(std.mem.indexOf(u8, message, "linux-x86_64") != null);
+}
+
+test "a refusal describes a root that was never installed" {
+    // The other half of the requirement: an absent root has no canonical
+    // spelling to report, and a diagnostic that gave up on it would leave the
+    // commonest `-Dndk` mistake — a typo, or an NDK that was never fetched —
+    // undescribed.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+    const missing = try path.join(gpa, &.{ root, "not-installed" });
+
+    try testing.expectError(
+        error.NotAnNdk,
+        Ndk.open(gpa, testing.io, missing, .linux_x86_64),
+    );
+
+    var probes = try Ndk.probeCandidates(gpa, testing.io, missing, .linux_x86_64);
+    defer probes.deinit(gpa);
+
+    try testing.expectEqual(HostTag.linux_x86_64, probes.host_tag);
+    try testing.expectEqual(@as(usize, 2), probes.entries.len);
+
+    const message = try probeMessage(missing, .linux_x86_64);
+    defer testing.allocator.free(message);
+
+    for (probes.entries) |entry| {
+        try testing.expect(std.mem.indexOf(u8, message, entry.sysroot) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, message, "linux-x86_64") != null);
+}
+
+test "probeCandidates names the paths discovery actually probed" {
+    // The drift guard. A diagnostic built from its own copy of the layout table
+    // can name a path that discovery never looked at, and it keeps doing so
+    // until the NDK moves a directory. These two trees are the only two layouts
+    // there are, and each has to be reported by the layout that answered.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    {
+        var scratch = testing.tmpDir(.{});
+        defer scratch.cleanup();
+        const root = try absPathOf(gpa, &scratch);
+        _ = try createAll(gpa, &.{
+            root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot",
+        });
+
+        const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+        try testing.expectEqual(Ndk.Shape.direct, ndk.shape);
+
+        var probes = try Ndk.probeCandidates(gpa, testing.io, root, .linux_x86_64);
+        defer probes.deinit(gpa);
+
+        try testing.expectEqual(Ndk.Shape.direct, probes.entries[0].shape);
+        try testing.expectEqual(Ndk.Shape.ndk_bundle, probes.entries[1].shape);
+        try testing.expectEqualStrings(root, probes.entries[0].ndk_root);
+        try testing.expectEqualStrings(ndk.sysroot(), probes.entries[0].sysroot);
+        try testing.expect(!std.mem.eql(u8, ndk.sysroot(), probes.entries[1].sysroot));
+    }
+    {
+        var scratch = testing.tmpDir(.{});
+        defer scratch.cleanup();
+        const root = try absPathOf(gpa, &scratch);
+        _ = try createAll(gpa, &.{
+            root,         "libexec", "android-sdk", "ndk-bundle",
+            "toolchains", "llvm",    "prebuilt",    "linux-x86_64",
+            "sysroot",
+        });
+
+        const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+        try testing.expectEqual(Ndk.Shape.ndk_bundle, ndk.shape);
+
+        var probes = try Ndk.probeCandidates(gpa, testing.io, root, .linux_x86_64);
+        defer probes.deinit(gpa);
+
+        try testing.expectEqual(Ndk.Shape.ndk_bundle, probes.entries[1].shape);
+        try testing.expectEqualStrings(ndk.sysroot(), probes.entries[1].sysroot);
+
+        const bundle_root = try path.join(gpa, &.{
+            root, "libexec", "android-sdk", "ndk-bundle",
+        });
+        try testing.expectEqualStrings(bundle_root, probes.entries[1].ndk_root);
+    }
+}
+
+test "the probed paths name the host tag they were built for" {
+    // A refusal about a toolchain the caller never asked for is worse than no
+    // refusal, so the tag has to be an argument rather than something read off
+    // the machine behind the caller's back.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    var probes = try Ndk.probeCandidates(gpa, testing.io, root, .darwin_x86_64);
+    defer probes.deinit(gpa);
+    try testing.expectEqual(HostTag.darwin_x86_64, probes.host_tag);
+
+    const message = try probeMessage(root, .darwin_x86_64);
+    defer testing.allocator.free(message);
+    try testing.expect(std.mem.indexOf(u8, message, "darwin-x86_64") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "linux-x86_64") == null);
+}
+
+test "a plain file named like an API level is not an API level" {
+    // The defect this catches: `libcDirFor` gated on existence while
+    // `apiLevelsFor` gated on `entry.kind == .directory`. A regular file named
+    // `99` was correctly left out of the level list and still accepted as a
+    // `crt_dir`, so the build failed later, at link time, with a message about
+    // libc pointing nowhere near the file that caused it.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    const triple_dir = try createAll(gpa, &.{
+        root,  "toolchains", "llvm",                  "prebuilt", "linux-x86_64", "sysroot",
+        "usr", "lib",        "aarch64-linux-android",
+    });
+    for ([_][]const u8{ "21", "35" }) |level| {
+        _ = try createAll(gpa, &.{ triple_dir, level });
+    }
+    // Parses as an API level, is not one.
+    try createFile(try path.join(gpa, &.{ triple_dir, "99" }), "not a directory");
+
+    const ndk = try Ndk.open(gpa, testing.io, root, .linux_x86_64);
+
+    // The iterator never reported it...
+    const levels = try ndk.apiLevelsFor(gpa, testing.io, .arm64_v8a);
+    try testing.expectEqualSlices(u32, &.{ 21, 35 }, levels);
+
+    // ...and the stat that libcDirFor now uses refuses it the same way. The two
+    // answers have to come from one predicate, or the file lands back in the
+    // middle.
+    try testing.expectError(
+        error.ApiLevelUnavailable,
+        ndk.libcDirFor(gpa, testing.io, .arm64_v8a, 99),
+    );
+
+    // The real levels are untouched.
+    const crt_dir = try ndk.libcDirFor(gpa, testing.io, .arm64_v8a, 35);
+    const expected = try path.join(gpa, &.{ triple_dir, "35" });
+    try testing.expectEqualStrings(expected, crt_dir);
+}
+
+test "a root that is a plain file is not an NDK" {
+    // The defect this catches: `open` documents `error.NotAnNdk` for a root that
+    // is not a usable installation, and an unzipped archive is exactly a regular
+    // file. `realPathFileAlloc` succeeds on a file, so the probe walked to
+    // `<file>/toolchains/...`, got `NotDir`, and handed that syscall code back
+    // to a caller that can act on nothing but "that is not an NDK".
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const root = try absPathOf(gpa, &scratch);
+
+    const archive = try path.join(gpa, &.{ root, "android-ndk-r29.zip" });
+    try createFile(archive, "PK\x03\x04 not really a zip");
+
+    try testing.expectError(
+        error.NotAnNdk,
+        Ndk.open(gpa, testing.io, archive, .linux_x86_64),
+    );
+
+    // The refusal still describes what was probed, which is the whole point of
+    // the diagnostic: the paths under a file are exactly what a user needs to
+    // see to work out that the thing they named is a file.
+    const message = try probeMessage(archive, .linux_x86_64);
+    defer testing.allocator.free(message);
+    try testing.expect(std.mem.indexOf(u8, message, "android-ndk-r29.zip") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "ndk_bundle:") != null);
+}
+
+test "an ABI round-trips through its on-disk directory name" {
+    // Every name the NDK ships maps back, and nothing else does.
+    for (std.enums.values(Abi)) |abi| {
+        try testing.expectEqual(abi, Abi.fromDirectoryName(abi.directoryName()));
+    }
+    try testing.expectEqual(Abi.arm64_v8a, Abi.fromDirectoryName("arm64-v8a"));
+
+    // The inverse is exact, and every one of these is the way a caller
+    // misspells the name: the Zig tag for the directory name, the shouted
+    // spelling, a trailing separator carried over from a path, a name with a
+    // stray space, and the empty string.
+    const rejected = [_][]const u8{
+        "arm64_v8a",
+        "ARM64-V8A",
+        "armeabi-v7a/",
+        " arm64-v8a",
+        "arm64-v8a ",
+        "x86-64",
+        "arm64",
+        "",
+    };
+    for (rejected) |name| {
+        try testing.expectEqual(@as(?Abi, null), Abi.fromDirectoryName(name));
+    }
+
+    // The five names are distinct, so no name can resolve to two ABIs.
+    const abis = std.enums.values(Abi);
+    for (abis, 0..) |a, i| {
+        for (abis, 0..) |b, j| {
+            if (j <= i) continue;
+            try testing.expect(Abi.fromDirectoryName(a.directoryName()) != b);
+        }
+    }
+}

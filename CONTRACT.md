@@ -87,9 +87,9 @@ the NDK's own `meta/abis.json`, read on this host:
 | `riscv64` | 64 | `riscv64-linux-android` | 35 |
 
 Zig's corresponding ABI tags are `.android` / `.androideabi`
-(`lib/std/Target.zig` :774-776). Zig models the Android API level natively:
+(`lib/std/Target.zig` :775-776). Zig models the Android API level natively:
 `std.Target.Query.android_api_level` (`lib/std/Target/Query.zig` :41-43,
-parsed at :253-256, emitted into the LLVM triple at :468-472), and
+parsed at :253-256, emitted into the LLVM triple at :468-473), and
 `std.Target` defaults it to 29 (`lib/std/Target.zig` :484).
 
 Zig already knows the Android CRT object names
@@ -182,10 +182,20 @@ consumer's own code, through the sysroot `include_dir`, which is the
 
 ### D6 — `crt_dir` is the API-level directory, not the triple directory
 
-`crt_dir` must be `usr/lib/<triple>/<api>` because the CRT objects
-(`crtbegin_dynamic.o`, `crtend_android.o`) exist only there, and the
-API-agnostic `libc.a` / `libc++_shared.so` sit beside them in the same
-directory. Verified by reading `sysroot/usr/lib/aarch64-linux-android/35/`.
+`crt_dir` must be `usr/lib/<triple>/<api>` because the five CRT objects live
+only there. Verified by listing the r29 tree: `usr/lib/aarch64-linux-android/35/`
+holds `crtbegin_dynamic.o`, `crtbegin_so.o`, `crtbegin_static.o`,
+`crtend_android.o`, `crtend_so.o` and `crt_pad_segment.o`, alongside the
+API-level shared libraries `libc.so`, `libm.so` and the `libc++.so` / `libc++.a`
+linker scripts.
+
+The API-agnostic archives are NOT there. `libc.a`, `libc++_shared.so`,
+`libc++_static.a`, `libc++abi.a`, `libm.a`, `libdl.a` and `libz.a` are siblings
+of the numeric API directories, one level up in the triple directory. This is
+the load-bearing consequence: `crt_dir` cannot serve a `-static` link or a
+`libc++_shared` link, because neither archive is reachable from it. That is why
+the link gate uses `linkage = .dynamic` and why the paths file carries no
+separate library search path.
 
 - **Counterchoice.** `usr/lib/<triple>` with an explicit API-level library path
   appended by the consumer. Genuinely wins if a future NDK moves the CRT
@@ -198,20 +208,30 @@ Module `ndk`, root `root.zig`:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `Abi` | enum | The five NDK ABI directory names |
-| `HostTag` | enum | `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-arm64`, `windows-x86_64` |
-| `Ndk` | struct | A resolved installation: root, host tag, sysroot |
+| `Abi` | enum | The five NDK ABI names, as `meta/abis.json` keys and `ANDROID_ABI` values |
+| `Abi.directoryName` | fn | ABI → that name. **Not** a path component of the sysroot: `usr/lib/` is namespaced by triple |
+| `Abi.fromDirectoryName` | fn | The inverse. Exact match only — no case folding, trimming or separator stripping |
+| `Abi.triple` | fn | ABI → the sysroot triple under `usr/lib/<triple>/` |
+| `Abi.minApiLevel` | fn | ABI → the NDK-declared floor, from `min_os_version` |
+| `Abi.zigAbi` | fn | ABI → `std.Target.Abi` (`.android` / `.androideabi`) |
+| `HostTag` | enum | The three host tags Google actually publishes: `linux-x86_64`, `darwin-x86_64`, `windows-x86_64` |
+| `HostTag.directoryName` | fn | Host tag → the on-disk directory under `toolchains/llvm/prebuilt/` |
+| `Ndk` | struct | A resolved installation: `root_path`, `host_tag`, `sysroot_path`, `shape` |
+| `Ndk.Shape` | enum | Which of the two recognised layouts `root_path` was found under |
 | `Ndk.find` | fn | Discovery over the documented env-var order |
 | `Ndk.open` | fn | Open a root given explicitly |
-| `Ndk.hostTag` | fn | Resolve the host tag for a host triple |
-| `Ndk.tripleFor` | fn | ABI → NDK sysroot triple |
-| `Ndk.libcDirFor` | fn | ABI + API level → `usr/lib/<triple>/<api>` |
-| `Ndk.apiLevelsFor` | fn | API levels present on disk for an ABI |
-| `Abi.triple` | fn | ABI → sysroot triple |
-| `Abi.minApiLevel` | fn | ABI → NDK-declared floor |
-| `Abi.zigAbi` | fn | ABI → `std.Target.Abi` (`.android` / `.androideabi`) |
+| `Ndk.hostTag` | fn | Resolve the host tag for a target; `UnsupportedHost` where Google ships none |
 | `Ndk.sysroot` | fn | Absolute sysroot path for the resolved host tag |
-| `Error` | error set | Every refusal a caller can act on |
+| `Ndk.tripleFor` | fn | ABI → NDK sysroot triple |
+| `Ndk.libcDirFor` | fn | ABI + API level → `usr/lib/<triple>/<api>`, where the CRT objects are |
+| `Ndk.apiLevelsFor` | fn | API levels present on disk for an ABI, sorted ascending |
+| `Ndk.readVersion` | fn | `Pkg.Revision` from `source.properties`, or `VersionUnreadable` |
+| `Ndk.Version` | struct | A parsed `Pkg.Revision` — the version code to pin a build against |
+| `Ndk.Probes` | struct | Both layouts a candidate root was probed under, with the host tag |
+| `Ndk.probeCandidates` | fn | Build that `Probes` value, for a diagnostic |
+| `Ndk.describeProbeFailure` | fn | Render it into a caller's `std.Io.Writer`. This is how D3's promise is discharged |
+| `LibcPaths` | struct | The six-field paths file Zig's `LibCInstallation.parse` demands. `forAndroid`, `render`, `deinit` |
+| `Error` | error set | Every refusal a caller can act on. Six members, unchanged throughout |
 
 Ownership: an `Ndk` is a **borrowed view of a directory tree**. It owns no
 memory — every path is stored as a caller-supplied slice or a build-runner
