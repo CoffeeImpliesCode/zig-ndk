@@ -245,24 +245,24 @@ fn androidTarget() !std.Target {
 // 1. The ABI table
 // ---------------------------------------------------------------------------
 
-test "every ABI has a unique non-empty directory name and triple, and a floor r29 could declare" {
+test "every ABI has a unique non-empty name and triple, and a floor r29 could declare" {
     // The defect this catches: two ABIs sharing a triple resolve to one
     // `usr/lib/<triple>` directory, so the CRT objects and `libc.a` picked for
     // one of them are the other's. Both paths exist, nothing downstream
-    // complains, and the wrong libc is linked. A zeroed directory name is the
-    // same class of failure: it collapses `usr/lib/<triple>` to `usr/lib`, a
-    // real directory holding a `libc.a` for every ABI at once.
+    // complains, and the wrong libc is linked. A zeroed triple is the same
+    // class of failure: it collapses `usr/lib/<triple>` to `usr/lib`, a real
+    // directory holding a `libc.a` for every ABI at once.
     const abis = std.enums.values(Abi);
 
     for (abis, 0..) |a, i| {
-        try testing.expect(a.directoryName().len > 0);
+        try testing.expect(a.name().len > 0);
         try testing.expect(a.triple().len > 0);
 
-        // Neither may carry a separator. Both are joined onto a fixed prefix to
-        // make `usr/lib/<...>`, so a separator would relocate the lookup
-        // somewhere the sysroot holds no ABI and the failure would look like a
-        // missing directory rather than a typo in the table.
-        try testing.expect(std.mem.indexOfScalar(u8, a.directoryName(), path.sep) == null);
+        // Neither may carry a separator. A name carrying one would let a
+        // `-Dabi=` argument carry path structure, and a lookup for it would
+        // resolve to a path that is simply absent — a missing directory rather
+        // than a typo in the table.
+        try testing.expect(std.mem.indexOfScalar(u8, a.name(), path.sep) == null);
         try testing.expect(std.mem.indexOfScalar(u8, a.triple(), path.sep) == null);
 
         // The namespaced spelling must not drift from the method, since
@@ -279,15 +279,15 @@ test "every ABI has a unique non-empty directory name and triple, and a floor r2
         for (abis, 0..) |b, j| {
             if (j <= i) continue;
 
-            try testing.expect(!std.mem.eql(u8, a.directoryName(), b.directoryName()));
+            try testing.expect(!std.mem.eql(u8, a.name(), b.name()));
             try testing.expect(!std.mem.eql(u8, a.triple(), b.triple()));
 
             // The two namespaces must not collide with each other either.
             // `armeabi-v7a` and `arm-linux-androideabi` name different
             // directories under `usr/lib`, and swapping one for the other
             // yields a path that is simply absent.
-            try testing.expect(!std.mem.eql(u8, a.directoryName(), b.triple()));
-            try testing.expect(!std.mem.eql(u8, a.triple(), b.directoryName()));
+            try testing.expect(!std.mem.eql(u8, a.name(), b.triple()));
+            try testing.expect(!std.mem.eql(u8, a.triple(), b.name()));
         }
     }
 }
@@ -322,17 +322,16 @@ test "only 32-bit ARM is androideabi, and the float ABI follows from that" {
     try testing.expectEqual(Target.Abi.Float.hard, Abi.x86_64.zigAbi().float());
 }
 
-test "an ABI directory name resolves back to exactly one ABI, and a near miss to none" {
-    // The defect this catches: `Abi.directoryName` and `Abi.fromDirectoryName`
-    // are two halves of one mapping, and a table where only one of them moved
-    // still compiles and still looks right on the page. Two tags sharing a
-    // directory name makes the reverse lookup answer with the first for both,
-    // so `-Dabi=` selects a sysroot the caller did not name; a name spelled
-    // wrongly still leaves the ABI with a correct triple and a directory that
-    // is not on disk. Neither is visible anywhere else in this package.
+test "an ABI name resolves back to exactly one ABI, and a near miss to none" {
+    // The defect this catches: `Abi.name` and `Abi.fromName` are two halves of
+    // one mapping, and a table where only one of them moved still compiles and
+    // still looks right on the page. Two tags sharing a name makes the reverse
+    // lookup answer with the first for both, so `-Dabi=` selects an ABI the
+    // caller did not name; a name spelled wrongly still leaves the ABI with a
+    // correct triple. Neither is visible anywhere else in this package.
     for (std.enums.values(Abi)) |a| {
-        const found = Abi.fromDirectoryName(a.directoryName()) orelse {
-            std.debug.print("no ABI has the directory name '{s}'\n", .{a.directoryName()});
+        const found = Abi.fromName(a.name()) orelse {
+            std.debug.print("no ABI has the name '{s}'\n", .{a.name()});
             return error.TestUnexpectedResult;
         };
         try testing.expectEqual(a, found);
@@ -340,9 +339,9 @@ test "an ABI directory name resolves back to exactly one ABI, and a near miss to
 
     // A name that is a near miss of a real one resolves to nothing, rather
     // than to a prefix match, an ignoring case, or a trailing separator. The
-    // third and fourth entries are the Zig tags, which are not directory names
-    // at all: the enum spells `-` as `_`, so accepting one is exactly the
-    // `@tagName`-instead-of-`directoryName` mistake this catches.
+    // third and fourth entries are the Zig tags, which the NDK never writes as
+    // an ABI name: the enum spells `-` as `_`, so accepting one is exactly the
+    // `@tagName`-instead-of-`name` mistake this catches.
     for ([_][]const u8{
         "arm64-v8",
         "ARM64-V8A",
@@ -353,7 +352,7 @@ test "an ABI directory name resolves back to exactly one ABI, and a near miss to
         "x86-64",
         "",
     }) |name| {
-        try testing.expect(Abi.fromDirectoryName(name) == null);
+        try testing.expect(Abi.fromName(name) == null);
     }
 }
 

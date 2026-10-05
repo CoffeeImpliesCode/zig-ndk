@@ -1985,7 +1985,7 @@ const libc_file_helper_source =
     \\        );
     \\        return error.MissingAbi;
     \\    };
-    \\    const abi = abiByDirectoryName(wanted) orelse {
+    \\    const abi = abiByName(wanted) orelse {
     \\        std.log.err(
     \\            "the zig-ndk module has no ABI named '{s}'. The names it does " ++
     \\                "carry are {s}, and that list is `zig_ndk.abi_directory_names` " ++
@@ -2155,9 +2155,9 @@ const libc_file_helper_source =
     \\    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = contents.written() });
     \\}
     \\
-    \\fn abiByDirectoryName(name: []const u8) ?ndk.Abi {
+    \\fn abiByName(name: []const u8) ?ndk.Abi {
     \\    for (std.enums.values(ndk.Abi)) |candidate| {
-    \\        if (std.mem.eql(u8, candidate.directoryName(), name)) return candidate;
+    \\        if (std.mem.eql(u8, candidate.name(), name)) return candidate;
     \\    }
     \\    return null;
     \\}
@@ -2175,7 +2175,7 @@ const libc_file_helper_source =
     \\        var out: std.Io.Writer.Allocating = .init(gpa);
     \\        for (std.enums.values(ndk.Abi), 0..) |candidate, i| {
     \\            if (i != 0) try out.writer.print(", ", .{});
-    \\            try out.writer.print("{s}", .{candidate.directoryName()});
+    \\            try out.writer.print("{s}", .{candidate.name()});
     \\        }
     \\        return out.written();
     \\    }
@@ -2225,7 +2225,7 @@ const libc_file_helper_source =
     \\        }
     \\        for (gates) |gate| {
     \\            const name = gate[0];
-    \\            const abi = abiByDirectoryName(name) orelse {
+    \\            const abi = abiByName(name) orelse {
     \\                announceInternalCheck();
     \\                std.log.err(
     \\                    "  '{s}': the table lists it, and the zig-ndk module does not have it",

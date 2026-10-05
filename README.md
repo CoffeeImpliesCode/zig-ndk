@@ -319,7 +319,7 @@ const ndk = @import("ndk");
 pub fn main() void {
     inline for (std.enums.values(ndk.Abi)) |abi| {
         std.debug.print("{s} {s} {d}\n", .{
-            abi.directoryName(),
+            abi.name(),
             abi.triple(),
             abi.minApiLevel(),
         });
@@ -327,8 +327,8 @@ pub fn main() void {
 
     // The inverse mapping, so a name from a `-Dabi=` or an `ANDROID_ABI`
     // becomes an `Abi` without the caller carrying its own five-entry table.
-    if (ndk.Abi.fromDirectoryName("arm64-v8a")) |abi| {
-        std.debug.print("{s} is {s}\n", .{ abi.directoryName(), abi.triple() });
+    if (ndk.Abi.fromName("arm64-v8a")) |abi| {
+        std.debug.print("{s} is {s}\n", .{ abi.name(), abi.triple() });
     }
 }
 ```
@@ -535,7 +535,7 @@ copy of the expectation. The integration suite repeats that round trip from a
 resolved synthetic sysroot, which is the load-bearing test in the package.
 
 Covered, for the descriptor: that each `Abi` tag maps to its `meta/abis.json`
-key, sysroot triple and `min_os_version`; that `Abi.fromDirectoryName` is the
+key, sysroot triple and `min_os_version`; that `Abi.fromName` is the
 exact inverse and answers `null` for the Zig-tag spellings (`arm64_v8a`) and for
 case variants; that only 32-bit ARM is `.androideabi` and every other ABI is
 `.android`; that the three `HostTag`s all end in `_x86_64` and that a host Google

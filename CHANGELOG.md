@@ -122,8 +122,8 @@ the set of tags those three accessors map, because a tag deleted from the enum
 while its switch arms stayed behind still scrapes clean and no longer compiles.
 `root.zig`'s comptime block pins `abis.len == 5` and rejects a triple or key
 shared by two ABIs, which is what catches a table edited into a shape the NDK
-would never ship. `Abi.fromDirectoryName` is asserted to be the exact inverse
-of `directoryName`, so the two halves cannot drift.
+would never ship. `Abi.fromName` is asserted to be the exact inverse
+of `name`, so the two halves cannot drift.
 
 **What a bump does, in this order:** re-read `meta/abis.json`; update the table in
 `src/ndk.zig`; update the two pins in `root.zig` that assume five ABIs
@@ -388,6 +388,61 @@ should be enforced — only recorded. What would revisit this entry is a compile
 bump: at 0.17.0, `render` is re-read against the new `LibCInstallation.render`
 and the twenty-six lines re-diffed, since that is exactly the change that would
 silently move them.
+
+
+### p0011 — the ABI accessor is named for what it returns, not for what a reader would assume
+
+`Abi.directoryName` is `Abi.name`. `Abi.fromDirectoryName` is `Abi.fromName`.
+Nothing else moved: the same five strings, the same exact-match rule, the same
+round trip, the same `Error` set.
+
+The old name was wrong in the one way a name can be. Read r29's sysroot on this
+host: `sysroot/usr/lib/` holds exactly five directories —
+`aarch64-linux-android`, `arm-linux-androideabi`, `i686-linux-android`,
+`riscv64-linux-android` and `x86_64-linux-android` — and **every one is named
+by triple**. There is no `arm64-v8a` directory, no `armeabi-v7a` directory, no
+`x86` directory and no `x86_64` directory anywhere under `sysroot/usr/`. The
+five ABI names are the *keys* of `meta/abis.json` (p0003) and the values
+`ANDROID_ABI` and `APP_ABI` take. They are real names. They are just not path
+components — the fact p0003 already recorded, which the identifier then
+contradicted.
+
+**The collision is what made it a defect.** `HostTag.directoryName` is accurate:
+`toolchains/llvm/prebuilt/linux-x86_64` really is a directory, really is that
+name, and really is on disk. So one identifier in one package carried two
+meanings, and the honest one taught the dishonest one. A reader who learned
+`directoryName` from `HostTag` carried the convention to `Abi` and wrote
+`path.join(sysroot, "usr/lib", abi.directoryName())`, which is ENOENT. **No gate
+in this package noticed**, because every path this package builds comes from
+`triple` — the wrong use lived entirely outside anything tested, which is
+precisely why it survived to `0.1.0`.
+
+`HostTag.directoryName` keeps its name. For a host tag it *is* a directory name,
+and renaming an accurate accessor would trade one error for another. The
+asymmetry is now the point: after this change the two identifiers no longer
+collide, and reading `Abi.name` next to `HostTag.directoryName` tells a reader
+which of the two is a path.
+
+**This was a clean cutover, and that is the whole reason it was cheap.** The
+package is `0.1.0`, unreleased; the repository is private; nothing consumed the
+old spelling. So the old names were deleted rather than aliased, and no
+deprecation note was written. An alias here would have been worse than no alias:
+a deprecated name with no user teaches a reader that `directoryName` was ever
+the right word for a path component, which is the claim this entry exists to
+retract. A rename that had to be carried by two spellings would have taught the
+wrong one a second time.
+
+**Enforcer: the compiler, and one round-trip test.** `root.zig`'s comptime
+block reads `abi.name()` for every tag and rejects an empty one;
+`build.zig`'s generated helper reaches the table through `Abi.name` and
+`Abi.fromName`; `test/integration_test.zig` asserts `fromName` is the exact
+inverse of `name`. No gate would *reintroduce* the old spelling — that is a
+deliberate act that has to survive a review of this entry, which is what this
+entry is for.
+
+**What would revisit it:** an NDK bump that puts an ABI-named directory under
+`sysroot/usr/lib/`, which would make the name a path after all. r30 is not that
+bump. Read against the new tree, this entry and `Abi.name` are re-read together.
 
 
 ## Deferred, with reasons

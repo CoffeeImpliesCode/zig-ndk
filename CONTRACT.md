@@ -215,8 +215,8 @@ Module `ndk`, root `root.zig`:
 | Name | Kind | Meaning |
 |---|---|---|
 | `Abi` | enum | The five NDK ABI names, as `meta/abis.json` keys and `ANDROID_ABI` values |
-| `Abi.directoryName` | fn | ABI → that name. **Not** a path component of the sysroot: `usr/lib/` is namespaced by triple |
-| `Abi.fromDirectoryName` | fn | The inverse. Exact match only — no case folding, trimming or separator stripping |
+| `Abi.name` | fn | ABI → that name. **Not** a path component of the sysroot: `usr/lib/` is namespaced by triple |
+| `Abi.fromName` | fn | The inverse. Exact match only — no case folding, trimming or separator stripping |
 | `Abi.triple` | fn | ABI → the sysroot triple under `usr/lib/<triple>/` |
 | `Abi.minApiLevel` | fn | ABI → the NDK-declared floor, from `min_os_version` |
 | `Abi.zigAbi` | fn | ABI → `std.Target.Abi` (`.android` / `.androideabi`) |

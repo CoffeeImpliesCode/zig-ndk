@@ -135,9 +135,9 @@ comptime {
         // An empty name does not fail at configure time. It produces `usr/lib`
         // instead of `usr/lib/<triple>`, which is a real directory holding a
         // `libc.a` for every ABI at once.
-        if (abi.directoryName().len == 0 or abi.triple().len == 0) {
+        if (abi.name().len == 0 or abi.triple().len == 0) {
             @compileError(std.fmt.comptimePrint(
-                "zig-ndk: {s} has an empty ABI directory name or sysroot triple.",
+                "zig-ndk: {s} has an empty ABI name or sysroot triple.",
                 .{@tagName(abi)},
             ));
         }
@@ -176,10 +176,10 @@ comptime {
                     .{ @tagName(a), @tagName(b), a.triple() },
                 ));
             }
-            if (std.mem.eql(u8, a.directoryName(), b.directoryName())) {
+            if (std.mem.eql(u8, a.name(), b.name())) {
                 @compileError(std.fmt.comptimePrint(
-                    "zig-ndk: {s} and {s} share the ABI directory name {s}.",
-                    .{ @tagName(a), @tagName(b), a.directoryName() },
+                    "zig-ndk: {s} and {s} share the ABI name {s}.",
+                    .{ @tagName(a), @tagName(b), a.name() },
                 ));
             }
         }
