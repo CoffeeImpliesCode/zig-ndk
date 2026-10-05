@@ -1,0 +1,269 @@
+# zig-ndk — design contract
+
+Status: shape branch. Compiler pinned at **Zig 0.16.0** (tag
+`24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8`). NDK pinned at **r29**
+(`29.0.14206865`), unpacked and read on this host. Every claim below carries a
+proof label: **source reading**, **exercised compilation**, or **runtime
+observation**.
+
+## 1. The problem, established by execution
+
+Zig 0.16.0 ships **zero** NDK awareness. A full-tree grep for `ndk` in
+`lib/std` hits only `libcxx/include/__locale_dir/locale_base_api/android.h`
+(upstream libc++ code) and unrelated ML-KEM `Ndk` fields. `lib/std/Build.zig`
+contains no android reference at all.
+
+Four probes, run against Zig 0.16.0 on this host, the last of them against the
+unpacked NDK r29 sysroot:
+
+| Probe | Result | Label |
+|---|---|---|
+| `zig build-exe -target aarch64-linux-android` | exit 0, produces an ELF | exercised compilation |
+| `zig build-exe -target aarch64-linux-android -lc` | `error: unable to provide libc for target 'aarch64-linux.5.10...6.19-android.29'` | exercised compilation |
+| `--libc <sysroot>/usr/lib/aarch64-linux-android/35` | `error: unable to parse libc paths file at path ...: IsDir` | exercised compilation |
+| `--libc <generated paths file> -dynamic -lc` | **exit 0** | exercised compilation |
+
+The fourth probe's artefact, read with `file(1)`:
+
+```
+ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV),
+dynamically linked, interpreter /system/bin/linker64, for Android 35,
+built by NDK r29 (14206865), with debug_info, not stripped
+```
+
+That line is the whole product in one string: Zig compiled the binary, and
+bionic supplied the loader, the CRT and `libc`. `/system/bin/linker64` is the
+interpreter the r29 sysroot's `crtbegin_dynamic.o` asks for, and "built by NDK
+r29" is recorded by the linker from the sysroot it linked against.
+
+**Consequence.** A freestanding Android binary builds. Anything that needs
+bionic — `libc.so`, `libm.so`, the CRT objects, `stdio.h` — does not build from
+Zig's own resources, because Zig bundles no bionic (`lib/libc/` holds darwin,
+freebsd, glibc, mingw, musl, netbsd, openbsd, wasi and include, and nothing
+else). Suppointing it at the sysroot works, but only through a hand-written libc
+paths file, and `LibCInstallation.parse` will not accept a directory. That gap
+is what this package fills. It is the whole scope. The NDK's own build systems
+(`ndk-build`, its CMake toolchain file) are explicitly **out of scope**: they
+are translation systems, and translating them is a different project.
+
+## 2. The mechanism
+
+Zig consumes an external libc through a **libc paths file**
+(`lib/std/zig/LibCInstallation.zig`, `parse` at :41, `render` at :123). Six
+fields, all six mandatory, split on `\n`, `=` separating name from value,
+`#` starting a comment:
+
+```
+include_dir        # dir containing stdlib.h
+sys_include_dir    # dir containing sys/errno.h
+crt_dir            # dir containing crt1.o / crtbegin_*.o ; required for non-Darwin
+msvc_lib_dir       # Windows only; may be empty
+kernel32_lib_dir   # Windows only; may be empty
+gcc_dir            # Haiku only; may be empty
+```
+
+`parse` rejects the file unless every field is present (`:79-84`), and rejects
+it unless `include_dir` and `sys_include_dir` are non-empty (`:85-92`) and,
+for every non-Darwin target, `crt_dir` is non-empty (`:95-98`).
+
+For an Android NDK r29 the mapping is mechanical:
+
+| Field | Value |
+|---|---|
+| `include_dir` | `<ndk>/toolchains/llvm/prebuilt/<host-tag>/sysroot/usr/include` |
+| `sys_include_dir` | same directory |
+| `crt_dir` | `<sysroot>/usr/lib/<triple>/<api-level>` |
+| `msvc_lib_dir`, `kernel32_lib_dir`, `gcc_dir` | empty (present, valueless) |
+
+`<triple>` and the ABI directory names are **not** Zig triples. They come from
+the NDK's own `meta/abis.json`, read on this host:
+
+| ABI dir | bitness | triple | min API |
+|---|---|---|---|
+| `armeabi-v7a` | 32 | `arm-linux-androideabi` | 21 |
+| `arm64-v8a` | 64 | `aarch64-linux-android` | 21 |
+| `x86` | 32 | `i686-linux-android` | 21 |
+| `x86_64` | 64 | `x86_64-linux-android` | 21 |
+| `riscv64` | 64 | `riscv64-linux-android` | 35 |
+
+Zig's corresponding ABI tags are `.android` / `.androideabi`
+(`lib/std/Target.zig` :774-776). Zig models the Android API level natively:
+`std.Target.Query.android_api_level` (`lib/std/Target/Query.zig` :41-43,
+parsed at :253-256, emitted into the LLVM triple at :468-472), and
+`std.Target` defaults it to 29 (`lib/std/Target.zig` :484).
+
+Zig already knows the Android CRT object names
+(`lib/std/zig/LibCInstallation.zig` :737-750: `crtbegin_so.o`,
+`crtbegin_dynamic.o`, `crtbegin_static.o` / `crtend_android.o`,
+`crtend_so.o`). Those names exist in the r29 sysroot at
+`sysroot/usr/lib/<triple>/<api>/`, so pointing `crt_dir` there is sufficient and
+no manual object-file wiring is needed.
+
+## 3. Decisions
+
+Every contested decision carries the five-part record. Where Zig's own type
+system or safety fixes the choice, the record is replaced by an obligation with
+the language fact named.
+
+### D1 — Publish the layout facts, not a hardcoded path table
+
+- **Priority.** A consumer on a different NDK revision, host tag, or API level
+  must be able to use this package without editing it.
+- **Constraint.** The path map is NDK-owned and moves between revisions; the
+  five ABI entries above were read from r29's `meta/abis.json`, not from a
+  spec.
+- **Cost on consumers.** Discovery touches the filesystem, so a missing or
+  relocated NDK surfaces as a build-configuration error rather than at link
+  time.
+- **Counterchoice.** Hardcode the five ABIs as a comptime table. Genuinely wins
+  if the package must configure with zero filesystem access, which is not this
+  package's job — it configures a build, and the build already has an IO
+  implementation.
+- **Grade.** shape · design constraint · documented in README.
+
+### D2 — The published module is the NDK descriptor; the build script is the build-only half
+
+Two routes, because a consumer needs both and they have different audiences.
+
+| Consumer need | Route |
+|---|---|
+| read ABI names, triples, API levels, sysroot paths from Zig code | registered module `ndk`, root `root.zig` |
+| wire `-Dtarget=…-linux-android` into a compilation | `pub const` re-exports at the end of `build.zig` |
+
+This follows the house pattern in `foundation-predicates`, where the C surface
+is published as a module and the artefact is linked through it.
+
+- **Counterchoice.** A single module that also does build wiring. Genuinely
+  wins when the audience is one in-repo consumer; it loses the moment an
+  out-of-tree consumer needs only the facts, because it drags `std.Build` into
+  their module's imports — and a module's import table is per-module, not
+  transitive, so they would have to add `std.Build`'s dependencies themselves.
+- **Grade.** shape · design constraint.
+
+### D3 — Discovery order is explicit and each source is named
+
+`--build-file`-independent order, first hit wins:
+
+1. `-Dndk=<path>` build option (explicit beats implicit, always)
+2. `ANDROID_NDK_HOME`
+3. `ANDROID_NDK_ROOT`
+4. `ANDROID_NDK`
+
+`ANDROID_NDK_HOME` first because Google's own CMake toolchain prefers it and it
+is the least surprising to a user who set it deliberately.
+
+- **Cost on consumers.** An inherited `ANDROID_NDK_HOME` from an unrelated shell
+  silently wins over a local checkout. Mitigated by the error message naming
+  every path tried, in order.
+- **Counterchoice.** Fail rather than read the environment. Genuinely wins in
+  CI, where an inherited variable is a reproducibility hazard. Not the default:
+  it makes the common single-shell case worse.
+- **Grade.** shape · design constraint.
+
+### D4 — `b.option` for NDK discovery, not a hand-rolled `-D` flag
+
+The foundation per-fork contract item 4 names `b.systemIntegrationOption` as
+the first-class mechanism and calls a hand-rolled `-D` flag a defect. That
+option governs *linking a system library by name*; NDK discovery resolves a
+directory tree and then synthesises a libc paths file, which is not that shape.
+`b.option` is the standard-option mechanism and is used instead.
+
+- **Grade.** shape · house constraint · `docs/01-first-wave.md` §4.3 item 4.
+
+### D5 — No vendored C, no `addTranslateC`
+
+The package ships Zig code that *describes* a sysroot. There is no C source of
+ours and no header of ours to translate, so contract item 3
+(`b.addTranslateC`) does not apply. The NDK headers are consumed by the
+consumer's own code, through the sysroot `include_dir`, which is the
+"shipped header plus a link path" route in the surface rules.
+
+- **Grade.** shape · language-fixed (no C artefact exists to translate).
+
+### D6 — `crt_dir` is the API-level directory, not the triple directory
+
+`crt_dir` must be `usr/lib/<triple>/<api>` because the CRT objects
+(`crtbegin_dynamic.o`, `crtend_android.o`) exist only there, and the
+API-agnostic `libc.a` / `libc++_shared.so` sit beside them in the same
+directory. Verified by reading `sysroot/usr/lib/aarch64-linux-android/35/`.
+
+- **Counterchoice.** `usr/lib/<triple>` with an explicit API-level library path
+  appended by the consumer. Genuinely wins if a future NDK moves the CRT
+  objects up a level. It loses today: it makes every consumer re-derive a path
+  that the sysroot already namespaces.
+
+## 4. Published surface
+
+Module `ndk`, root `root.zig`:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `Abi` | enum | The five NDK ABI directory names |
+| `HostTag` | enum | `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-arm64`, `windows-x86_64` |
+| `Ndk` | struct | A resolved installation: root, host tag, sysroot |
+| `Ndk.find` | fn | Discovery over the documented env-var order |
+| `Ndk.open` | fn | Open a root given explicitly |
+| `Ndk.hostTag` | fn | Resolve the host tag for a host triple |
+| `Ndk.tripleFor` | fn | ABI → NDK sysroot triple |
+| `Ndk.libcDirFor` | fn | ABI + API level → `usr/lib/<triple>/<api>` |
+| `Ndk.apiLevelsFor` | fn | API levels present on disk for an ABI |
+| `Abi.triple` | fn | ABI → sysroot triple |
+| `Abi.minApiLevel` | fn | ABI → NDK-declared floor |
+| `Abi.zigAbi` | fn | ABI → `std.Target.Abi` (`.android` / `.androideabi`) |
+| `Ndk.sysroot` | fn | Absolute sysroot path for the resolved host tag |
+| `Error` | error set | Every refusal a caller can act on |
+
+Ownership: an `Ndk` is a **borrowed view of a directory tree**. It owns no
+memory — every path is stored as a caller-supplied slice or a build-runner
+slice whose lifetime is the build. There is no `deinit`, and that is the
+documented contract, not an omission. A caller who needs a path after the
+build run must copy it into its own storage; `deinit` is deliberately absent so
+that a caller cannot believe a `Ndk` owns anything.
+
+Errors are a closed set, never `anyerror`:
+
+| Error | Meaning | Caller can act |
+|---|---|---|
+| `NdkNotFound` | no candidate path exists or none was set | set `-Dndk` or the env var |
+| `NotAnNdk` | a candidate exists but has no `toolchains/llvm/prebuilt/<host-tag>/sysroot` | point at an unpacked NDK, not a zip or an SDK root |
+| `UnsupportedHost` | this host has no NDK host tag | build on a supported host, or cross the toolchain yourself |
+| `UnsupportedAbi` | the ABI is not in this NDK's `meta/abis.json` | pick a shipped ABI |
+| `ApiLevelUnavailable` | no `usr/lib/<triple>/<api>` for that level | pick a level the sysroot ships |
+| `VersionUnreadable` | `source.properties` absent or unparsable | still usable; only the reported version is unknown |
+
+`VersionUnreadable` is deliberately non-fatal in the sense that the `Ndk` value
+is still returned with a `null` version — it is an error only where a caller
+demands the version. The reader reports it; discovery does not fail on it.
+
+## 5. What is not claimed
+
+- **The positive libc link was proven by `zig build-exe`, not by `zig build`.**
+  Probe 4 in §1 is an exercised compilation of a single trivial `pub fn main`
+  against one ABI (`aarch64-linux-android`, API 35, r29). What remains
+  unproven until phase 5 is green: that the same thing works through this
+  package's own `build.zig` wiring, and for the other four ABIs and their API
+  levels. The mechanism is no longer a prediction; its per-ABI coverage is.
+- **No claim about any other NDK revision.** r29 was read. r30 exists and is the
+  current LTS; r27/r28 layouts were not verified on this host.
+- **No claim about `ndk-build` or the CMake toolchain file**, by scope.
+- **No speed, size, or throughput claim.** Nothing here was measured.
+- **No runtime observation.** The linked Android binary was never executed; it
+  cannot be, on this host. Everything claimed of it is what `file(1)` reads
+  from its headers.
+
+## 6. Gate ladder
+
+Per the foundation per-fork contract §4.3, adapted: this package has no C of its
+own, so items 2, 3 and 6 apply in their Zig-only form, and the ABI gate (from
+`libffi`'s `abicheck/`) becomes a **path-agreement gate**: for every ABI and
+every API level, the path the library computes must be a directory that exists.
+
+| Gate | Command | What a green run establishes |
+|---|---|---|
+| fmt | `zig build fmt-check` | formatting |
+| host tests | `zig build test` | parsing, discovery ordering, error paths, on the host target |
+| cross compile | `zig build ndk-abi-check` | each ABI's `std.Build` target query resolves and the module compiles for it |
+| libc link | `zig build ndk-link-check` | Zig links a bionic Android binary against the real sysroot |
+
+The last gate is the one that decides whether this package is useful. Until it
+is green, `ndk-link-check` is the honest name for what is being attempted.
