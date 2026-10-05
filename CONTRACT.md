@@ -81,10 +81,10 @@ For an Android NDK r29 the mapping is mechanical:
 | `crt_dir` | `<sysroot>/usr/lib/<triple>/<api-level>` |
 | `msvc_lib_dir`, `kernel32_lib_dir`, `gcc_dir` | empty (present, valueless) |
 
-`<triple>` and the ABI directory names are **not** Zig triples. They come from
+`<triple>` and the ABI names are **not** Zig triples. They come from
 the NDK's own `meta/abis.json`, read on this host:
 
-| ABI dir | bitness | triple | min API |
+| ABI | bitness | triple | min API |
 |---|---|---|---|
 | `armeabi-v7a` | 32 | `arm-linux-androideabi` | 21 |
 | `arm64-v8a` | 64 | `aarch64-linux-android` | 21 |
@@ -237,6 +237,7 @@ Module `ndk`, root `root.zig`:
 | `Ndk.Probes.Entry` | struct | One probed layout: its `Shape`, the `ndk_root` it would be under, and the `sysroot` path it would resolve to |
 | `Ndk.probeCandidates` | fn | Build that `Probes` value, for a diagnostic |
 | `Ndk.describeProbeFailure` | fn | Render it into a caller's `std.Io.Writer`. This is how D3's promise is discharged |
+| `Ndk.describeDiscoveryFailure` | fn | Render the `NdkNotFound` refusal, naming every discovery source and what each read |
 | `LibcPaths` | struct | The six-field paths file Zig's `LibCInstallation.parse` demands. `forAndroid`, `render`, `deinit` |
 | `Error` | error set | Every refusal a caller can act on. Six members, unchanged throughout |
 
@@ -276,11 +277,14 @@ demands the version. The reader reports it; discovery does not fail on it.
 
 ## 5. What is not claimed
 
-- **The bionic link through `build.zig` is observed, for two ABIs, both at
+- **The bionic link through `build.zig` is observed, for every ABI, at
   API 35.** `zig build ndk-link-check` with `ANDROID_NDK_HOME` set exits 0 and
-  writes `zig-out/bin/ndk-link-check`, which the gate's own ELF check reads
-  back and which `file(1)` reports as an aarch64 Android PIE with interpreter
-  `/system/bin/linker64`, for Android 35, built by NDK r29. Measured matrix:
+  writes `zig-out/bin/ndk-link-check-<abi>-api<level>`, which the gate's own
+  ELF check reads back. The artefact is named for the ABI and API it was built
+  for, so a matrix run leaves one file per cell in `zig-out/bin` instead of
+  five runs overwriting one name. `file(1)` reports the default cell as an
+  aarch64 Android PIE with interpreter `/system/bin/linker64`, for Android 35,
+  built by NDK r29. Measured matrix:
 
   | ABI | API | Result |
   |---|---|---|

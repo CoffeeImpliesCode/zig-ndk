@@ -62,7 +62,7 @@ const AbiGate = struct {
     /// NOT a path component. `sysroot/usr/lib/` is namespaced by the sysroot
     /// triple, so no `arm64-v8a` or `x86` directory exists anywhere under it;
     /// `triple` below is what a path under `usr/lib` is spelled with.
-    directory: []const u8,
+    name: []const u8,
     /// NDK sysroot triple, which is not a Zig triple.
     triple: []const u8,
     /// Zig C ABI tag for that triple.
@@ -80,15 +80,25 @@ const AbiGate = struct {
     /// never looked at.
     elf_class: std.elf.CLASS,
     /// ELF `e_machine` value an artefact for this ABI carries, from
-    /// `std.elf.EM`. This is the load-bearing one: a host executable, or a
-    /// bionic binary for a different ABI, has the right magic and the right
-    /// OS/ABI and still fails here.
+    /// `std.elf.EM`. This one separates a bionic binary for a different ABI
+    /// from the one asked for: those share the magic, the class and the
+    /// OS/ABI and differ here.
+    ///
+    /// It does NOT separate a HOST artefact from an Android one, which is what
+    /// this field's doc used to claim. On x86_64 — the ABI this build host is
+    /// — a host glibc PIE carries the same `e_machine` (62), `EI_CLASS` (2),
+    /// `EI_DATA` (1) and `ELFOSABI_NONE` (0) as a bionic x86_64 binary, and the
+    /// link gate accepted one with exit 0. What separates them is after the
+    /// header: the Android program interpreter, and a `DT_NEEDED` naming
+    /// `libc.so` where glibc names `libc.so.6`. Both are checked now, and
+    /// neither is a field here: the soname is one string for all five ABIs and
+    /// the interpreter is decided by `elf_class`, which is the field above.
     elf_machine: std.elf.EM,
 };
 
 const abi_gates = [_]AbiGate{
     .{
-        .directory = "armeabi-v7a",
+        .name = "armeabi-v7a",
         .triple = "arm-linux-androideabi",
         .zig_abi = .androideabi,
         .cpu_arch = .arm,
@@ -97,7 +107,7 @@ const abi_gates = [_]AbiGate{
         .elf_machine = .ARM,
     },
     .{
-        .directory = "arm64-v8a",
+        .name = "arm64-v8a",
         .triple = "aarch64-linux-android",
         .zig_abi = .android,
         .cpu_arch = .aarch64,
@@ -106,7 +116,7 @@ const abi_gates = [_]AbiGate{
         .elf_machine = .AARCH64,
     },
     .{
-        .directory = "riscv64",
+        .name = "riscv64",
         .triple = "riscv64-linux-android",
         .zig_abi = .android,
         .cpu_arch = .riscv64,
@@ -115,7 +125,7 @@ const abi_gates = [_]AbiGate{
         .elf_machine = .RISCV,
     },
     .{
-        .directory = "x86",
+        .name = "x86",
         .triple = "i686-linux-android",
         .zig_abi = .android,
         .cpu_arch = .x86,
@@ -124,7 +134,7 @@ const abi_gates = [_]AbiGate{
         .elf_machine = .@"386",
     },
     .{
-        .directory = "x86_64",
+        .name = "x86_64",
         .triple = "x86_64-linux-android",
         .zig_abi = .android,
         .cpu_arch = .x86_64,
@@ -135,9 +145,9 @@ const abi_gates = [_]AbiGate{
 };
 
 /// The five NDK ABI names, for a consumer that iterates every ABI.
-pub const abi_directory_names = blk: {
+pub const abi_names = blk: {
     var names: [abi_gates.len][]const u8 = undefined;
-    for (abi_gates, 0..) |gate, i| names[i] = gate.directory;
+    for (abi_gates, 0..) |gate, i| names[i] = gate.name;
     break :blk names;
 };
 
@@ -324,7 +334,7 @@ pub fn build(b: *std.Build) void {
     const abi_check_step = b.step("ndk-abi-check", "Resolve a target query and compile the package for every NDK ABI");
     for (abi_gates) |gate| {
         const abi_test = b.addTest(.{
-            .name = b.fmt("ndk-{s}", .{gate.directory}),
+            .name = b.fmt("ndk-{s}", .{gate.name}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path("root.zig"),
                 .target = b.resolveTargetQuery(.{
@@ -365,8 +375,8 @@ pub fn build(b: *std.Build) void {
                 \\
                 \\  zig build ndk-link-check -Dabi=arm64-v8a
                 \\
-                \\Those five names live in one place, `abi_directory_names` in
-                \\this package's build half, reached as `zig_ndk.abi_directory_names`
+                \\Those five names live in one place, `abi_names` in
+                \\this package's build half, reached as `zig_ndk.abi_names`
                 \\from a dependent's build script and as `zig_ndk.Abi` at run time.
                 \\A `linkAndroid` caller that gets `error.UnsupportedAbi` is
                 \\looking at the same five.
@@ -382,10 +392,10 @@ pub fn build(b: *std.Build) void {
         // the one they can act on without looking anything up. `linkAndroid`
         // refuses the same pair with `error.ApiBelowLinkFloor`, so the library
         // and this gate cannot answer differently.
-        if (linksBelowApiFloor(api_level, optimize)) {
+        if (linksBelowApiFloor(api_level, optimize, gate)) {
             const refuse = std.Build.Step.Fail.create(
                 b,
-                apiBelowFloorMessage(b, "ndk-link-check", api_level, optimize),
+                apiBelowFloorMessage(b, "ndk-link-check", api_level, optimize, gate),
             );
             link_check_step.dependOn(&refuse.step);
             break :link_check;
@@ -420,8 +430,17 @@ pub fn build(b: *std.Build) void {
             .android_api_level = api_level,
         });
 
+        // The artefact is named for the ABI AND the API it was built for.
+        // A fixed name meant a matrix run over five ABIs resolved all five to
+        // one path in `zig-out/bin`, each overwriting the last, so the tree
+        // left behind was whichever ran last and said nothing about the other
+        // four. That is an evidential defect rather than a false green — the
+        // readback below still checked every artefact — but four documents
+        // point at that path as the evidence, and it could not carry it. With
+        // the ABI and API in the name, `zig-out/` IS the coverage record.
+        const link_artefact_name = b.fmt("ndk-link-check-{s}-api{d}", .{ gate.name, api_level });
         const link_exe = b.addExecutable(.{
-            .name = "ndk-link-check",
+            .name = link_artefact_name,
             .linkage = .dynamic,
             .root_module = b.createModule(.{
                 .root_source_file = b.addWriteFiles().add(
@@ -439,7 +458,7 @@ pub fn build(b: *std.Build) void {
         // layout, or of the file format, living in this file.
         _ = linkAndroid(b, ndk_module, link_exe, .{
             .ndk = ndk_root,
-            .abi = gate.directory,
+            .abi = gate.name,
             .api_level = api_level,
             .optimize = optimize,
             .check_abi_gates = true,
@@ -481,6 +500,7 @@ pub fn build(b: *std.Build) void {
             error.UnsupportedHost,
             error.UnsupportedAbi,
             error.ApiBelowLinkFloor,
+            error.OptimizeMismatch,
             error.TargetIsNotAndroid,
             => {
                 const refuse = std.Build.Step.Fail.create(b, b.fmt(
@@ -529,7 +549,7 @@ pub fn build(b: *std.Build) void {
         });
         const run_elf_check = b.addRunArtifact(elf_check);
         run_elf_check.addArgs(&.{
-            "--abi",     gate.directory,
+            "--abi",     gate.name,
             "--class",   b.fmt("{d}", .{@intFromEnum(gate.elf_class)}),
             "--machine", b.fmt("{d}", .{@intFromEnum(gate.elf_machine)}),
         });
@@ -678,9 +698,9 @@ pub fn build(b: *std.Build) void {
 }
 
 /// One NDK ABI, as a Zig target query, for `ndk-abi-check` and the link gate.
-fn gateFor(directory: []const u8) ?AbiGate {
+fn gateFor(name: []const u8) ?AbiGate {
     for (abi_gates) |gate| {
-        if (std.mem.eql(u8, gate.directory, directory)) return gate;
+        if (std.mem.eql(u8, gate.name, name)) return gate;
     }
     return null;
 }
@@ -690,7 +710,7 @@ fn joinGateNames(b: *std.Build) []const u8 {
     defer joined.deinit(b.allocator);
     for (abi_gates, 0..) |gate, i| {
         if (i != 0) joined.appendSlice(b.allocator, ", ") catch @panic("OOM");
-        joined.appendSlice(b.allocator, gate.directory) catch @panic("OOM");
+        joined.appendSlice(b.allocator, gate.name) catch @panic("OOM");
     }
     return joined.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
@@ -811,15 +831,26 @@ fn joinHostTagDirs(b: *std.Build) []const u8 {
     return joined.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
 
-/// Whether `api_level` and `optimize` together cannot link, whatever the ABI.
+/// Whether `api_level` and `optimize` together cannot link at `gate`.
 ///
 /// Deliberately narrow, and deliberately in this order of concerns: only
 /// `Debug` and `ReleaseSafe` carry the panic handler that reaches `preadv64`,
-/// and only below `min_link_api_level` does bionic lack it. The floor is the
-/// API LEVEL and not one ABI's, because the cause is bionic's libc; riscv64's
-/// own floor of 35 is above this one and is refused by the sysroot instead.
-fn linksBelowApiFloor(api_level: u32, optimize: std.builtin.OptimizeMode) bool {
-    if (api_level >= min_link_api_level) return false;
+/// and only below `min_link_api_level` does bionic lack it. That floor is the
+/// API LEVEL and not one ABI's, because the cause is bionic's libc.
+///
+/// The second half of the comparison is the ABI's OWN floor, and it is not
+/// optional. riscv64 declares 35, so a 21-floor guard fires for riscv64 at
+/// 21-23 and tells the reader to raise `-Dapi` to 24 — which riscv64 also
+/// does not have, so both remedies it names dead-end in `ApiLevelUnavailable`.
+/// Suppressing the refusal there hides the one message that would have been
+/// right. So the guard fires only below whichever floor is HIGHER: the
+/// generic 24, or this ABI's own.
+fn linksBelowApiFloor(
+    api_level: u32,
+    optimize: std.builtin.OptimizeMode,
+    gate: AbiGate,
+) bool {
+    if (api_level >= @max(min_link_api_level, gate.min_api_level)) return false;
     return switch (optimize) {
         .Debug, .ReleaseSafe => true,
         .ReleaseFast, .ReleaseSmall => false,
@@ -839,7 +870,49 @@ fn apiBelowFloorMessage(
     step_name: []const u8,
     api_level: u32,
     optimize: std.builtin.OptimizeMode,
+    gate: AbiGate,
 ) []const u8 {
+    // An ABI whose own floor is above the generic one gets its own message.
+    // The generic text says "bionic gained preadv64 at API 24" and offers
+    // `-Dapi=24`, and for riscv64 both are wrong: 24 is below its floor of 35,
+    // so the ld.lld transcript it quotes is unreachable and the remedy it
+    // prints cannot work. Naming the real floor is the only honest remedy.
+    if (gate.min_api_level > min_link_api_level) {
+        return b.fmt(
+            \\`{s}` was asked for API level {d} in a {s} build, and {s} cannot
+            \\link at that level at any optimization mode.
+            \\
+            \\This ABI's floor is higher than bionic's generic one. r29 declares
+            \\{d} as the lowest API level it ships for {s}, so the sysroot has no
+            \\usr/lib/{s}/{d} directory to link against:
+            \\
+            \\  error: no usr/lib/{s}/{d} in this sysroot: ApiLevelUnavailable
+            \\
+            \\The generic floor this check would otherwise name is API {d}, which
+            \\this ABI does not ship either, so that number is no remedy here.
+            \\Its real floor:
+            \\
+            \\  zig build {s} -Dapi={d}
+            \\
+            \\A `linkAndroid` caller sets the same value as `.api_level` on the
+            \\options handed to linkAndroid.
+            \\
+        , .{
+            step_name,
+            api_level,
+            @tagName(optimize),
+            gate.name,
+            gate.min_api_level,
+            gate.name,
+            gate.triple,
+            api_level,
+            gate.triple,
+            api_level,
+            min_link_api_level,
+            step_name,
+            gate.min_api_level,
+        });
+    }
     return b.fmt(
         \\`{s}` was asked for API level {d} in a {s} build, and no Android NDK
         \\can link that combination at any ABI.
@@ -850,7 +923,7 @@ fn apiBelowFloorMessage(
         \\
         \\  error: ld.lld: undefined symbol: preadv64
         \\  note: did you mean: pread64
-        \\  note: defined in: .../sysroot/usr/lib/<triple>/{d}/libc.so
+        \\  note: defined in: .../sysroot/usr/lib/{s}/{d}/libc.so
         \\
         \\which names a substitute symbol and neither of the two knobs that
         \\decide it. Two ways out, either one:
@@ -866,6 +939,7 @@ fn apiBelowFloorMessage(
         step_name,
         api_level,
         @tagName(optimize),
+        gate.triple,
         api_level,
         step_name,
         min_link_api_level,
@@ -991,7 +1065,7 @@ fn ndkNotFoundMessage(b: *std.Build, step_name: []const u8, explicit: ?[]const u
 /// What to do when this build host has no NDK package at all.
 ///
 /// The message `tools/sync-ndk.sh` prints for the same condition
-/// (tools/sync-ndk.sh:244-252), because the two refuse the same host for the
+/// (tools/sync-ndk.sh:286-293), because the two refuse the same host for the
 /// same reason and a reader who has run both should not learn two vocabularies.
 /// No path is offered: `error.UnsupportedHost` is not a claim about any path,
 /// so offering one would blame the reader for something they cannot change.
@@ -1100,13 +1174,27 @@ pub const AndroidLinkOptions = struct {
     /// `error.ApiBelowLinkFloor` rather than left to the linker.
     api_level: u32 = default_link_api_level,
     /// Optimization mode for the generated paths-file helper, which always
-    /// runs on the build host, AND for the Android compilation being wired.
+    /// runs on the build host.
     ///
-    /// The second half is load-bearing and was easy to miss: `.Debug` and
-    /// `.ReleaseSafe` carry the panic handler that reaches `std.Io.Threaded`,
-    /// which is why `.api_level` below `min_link_api_level` is refused for
-    /// exactly those two modes and allowed for the other two.
-    optimize: std.builtin.OptimizeMode = .Debug,
+    /// NOT the mode of the Android compilation being wired. That mode lives on
+    /// the module, at `compile.root_module.optimize`, and the API floor guard
+    /// reads it from there — a value set here cannot change what reaches the
+    /// linker, so it cannot decide that guard either.
+    ///
+    /// It is optional rather than defaulted, because a default here is a claim.
+    /// `.Debug` used to be the default, and a caller who set the module to
+    /// `.ReleaseSmall` and left this alone was refused with
+    /// `error.ApiBelowLinkFloor` for exactly the configuration the refusal's
+    /// own text tells them to use — it named `-Doptimize=ReleaseSmall` as the
+    /// way out and then refused to take it. `null` means "whatever the module
+    /// says", which is the only answer that cannot be wrong.
+    ///
+    /// A value that DISAGREES with `compile.root_module.optimize` is refused
+    /// with `error.OptimizeMismatch`, naming both. Silently preferring either
+    /// one would be a side effect the caller did not ask for, and a refusal
+    /// that names the disagreement is more honest than a precedence rule
+    /// nobody can see.
+    optimize: ?std.builtin.OptimizeMode = null,
     /// Opt into the ABI-table cross-check, and only that.
     ///
     /// When true, this build script hands its own `abi_gates` table to the
@@ -1201,7 +1289,37 @@ pub fn linkAndroid(
     // answered before it can be masked by an NDK that is missing, a path that
     // is wrong, or a host with no package at all.
     const gate = gateFor(options.abi) orelse return error.UnsupportedAbi;
-    if (linksBelowApiFloor(options.api_level, options.optimize)) return error.ApiBelowLinkFloor;
+    // The mode that reaches the linker is the MODULE's, not the option's.
+    // `Compile` builds with `root_module.optimize` (lib/std/Build/Module.zig
+    // :580, Step/Compile.zig:396), so reading `options.optimize` here decided
+    // the guard on a value that never reaches the linker. Both failure
+    // directions were reachable: a `.ReleaseSmall` module with the default
+    // `.Debug` option was refused for exactly the configuration the refusal's
+    // own text offers as the remedy, and a `.Debug` module with a
+    // `.ReleaseSmall` option passed the guard and then died in ld.lld with
+    // `undefined symbol: preadv64`, which is the one failure this guard exists
+    // to refuse up front.
+    const module_optimize = compile.root_module.optimize orelse std.builtin.OptimizeMode.Debug;
+    if (options.optimize) |claimed| {
+        if (claimed != module_optimize) {
+            std.log.err(
+                \\`linkAndroid` was handed two different optimization modes for
+                \\the same compilation: `.optimize` on AndroidLinkOptions says
+                \\{s}, and `compile.root_module.optimize` says {s}.
+                \\
+                \\The module's value is the one that reaches the linker, so the
+                \\option cannot be taken as the answer. Leave `.optimize` unset
+                \\to take the module's, or set the two to the same value:
+                \\
+                \\  .optimize = null,                         // use the module's
+                \\  .optimize = .ReleaseSmall,                // and set the module
+                \\  compile.root_module.optimize = .ReleaseSmall;
+                \\
+            , .{ @tagName(claimed), @tagName(module_optimize) });
+            return error.OptimizeMismatch;
+        }
+    }
+    if (linksBelowApiFloor(options.api_level, module_optimize, gate)) return error.ApiBelowLinkFloor;
     // The target and the sysroot have to be the same Android target, or the
     // linker produces four errors that name a missing file and a bad ELF
     // machine and never name the mismatch. Printed AND returned: a build
@@ -1265,7 +1383,7 @@ pub fn linkAndroid(
     const helper_module = b.createModule(.{
         .root_source_file = gen.add("ndk_libc_file.zig", libc_file_helper_source),
         .target = b.graph.host,
-        .optimize = options.optimize,
+        .optimize = options.optimize orelse std.builtin.OptimizeMode.Debug,
     });
     // The helper is the only thing in the build that may see the published
     // module, and it is the reason this file needs to know no NDK layout.
@@ -1325,7 +1443,7 @@ fn addGateRows(b: *std.Build, run: *std.Build.Step.Run) void {
     for (abi_gates) |gate| {
         run.addArgs(&.{
             "--gate",
-            gate.directory,
+            gate.name,
             gate.triple,
             @tagName(gate.zig_abi),
             b.fmt("{d}", .{gate.min_api_level}),
@@ -1379,13 +1497,26 @@ const link_check_main_source =
 /// architecture, so a magic check on its own cannot tell a bionic binary for
 /// `arm64-v8a` from a host x86-64 executable or from bionic for a different
 /// ABI. Both of those are silent regressions of the ABI wiring above, and a
-/// gate that cannot see them is not the gate this package needs. So the
-/// header is read far enough to check `EI_CLASS`, `EI_DATA`, `EI_OSABI` and
-/// `e_machine` as well, each against the ABI the gate was asked to build.
+/// gate that cannot see them is not the gate this package needs.
+///
+/// The header is read far enough to check `EI_CLASS`, `EI_DATA`, `EI_OSABI` and
+/// `e_machine`, each against the ABI the gate was asked to build. Those four
+/// are NOT enough, and the header alone was not: on x86_64 a host glibc PIE
+/// agrees with a bionic one on all four, and this gate accepted one with exit
+/// 0. So the file is read WHOLE and two checks past the header are made as
+/// well — `PT_INTERP` must name the Android linker for the class, and a
+/// `DT_NEEDED` must name `libc.so` where glibc names `libc.so.6`. Neither is a
+/// per-ABI field: the soname is one string for all five, and the interpreter
+/// follows from the class, which is already tied to the ABI row.
+///
+/// It prints one line naming the ABI, the class, the machine, the interpreter,
+/// the soname and the path when it passes. A gate that says nothing on success
+/// leaves no record, which is how a five-ABI matrix run ends with one
+/// ambiguous artefact and nothing saying the other four were checked.
 ///
 /// Invoked as
 ///
-///     ndk-elf-check --abi <dir> --class <EI_CLASS> --machine <e_machine> <path>
+///     ndk-elf-check --abi <name> --class <EI_CLASS> --machine <e_machine> <path>
 ///
 /// The three expectation arguments are arguments rather than constants for one
 /// reason: `-Dabi=` selects the ABI, and two of the five are 32-bit. The
@@ -1407,9 +1538,22 @@ const elf_check_source =
     \\
     \\const e_ident_len = std.elf.EI.NIDENT;
     \\const e_machine_offset = @offsetOf(std.elf.Elf64.Ehdr, "machine");
-    \\/// `e_ident` plus `e_type` plus `e_machine`, and nothing more: this gate
-    \\/// reads the header's identity, not the program headers after it.
-    \\const e_header_len = e_machine_offset + @sizeOf(std.elf.Half);
+    \\/// The FULL header, not `e_ident` plus `e_type` plus `e_machine`.
+    \\///
+    \\/// This gate used to read twenty bytes and stop, which is exactly why it
+    \\/// was blind: `e_machine` cannot separate a host artefact from an Android
+    \\/// one on x86_64, because a host x86_64 glibc PIE and a bionic x86_64
+    \\/// binary carry the same `e_machine`, `EI_CLASS`, `EI_DATA` and
+    \\/// `ELFOSABI_NONE`. Everything that does separate them lives AFTER the
+    \\/// header, in the program headers and the dynamic segment. So the whole
+    \\/// header is read, and then the file is read whole.
+    \\const e_header_len = @sizeOf(std.elf.Elf64.Ehdr);
+    \\const e_header_len_32 = @sizeOf(std.elf.Elf32.Ehdr);
+    \\/// Upper bound on the artefact this gate will read into memory. A linked
+    \\/// Android binary is a few megabytes; 256 MiB is far past any of them and
+    \\/// keeps a malformed `e_phoff` from asking for an allocation the size of
+    \\/// the machine.
+    \\const max_artefact_bytes = 256 * 1024 * 1024;
     \\
     \\comptime {
     \\    // Every index and offset below is taken from `std.elf` rather than
@@ -1427,6 +1571,30 @@ const elf_check_source =
     \\    if (std.elf.EI.CLASS >= e_ident_len or std.elf.EI.DATA >= e_ident_len or
     \\        std.elf.EI.OSABI >= e_ident_len)
     \\        @compileError("an EI_* index now falls outside e_ident");
+    \\    // The program-header walk below reads `e_phoff`, `e_phentsize` and
+    \\    // `e_phnum` by offset, so those offsets are pinned too. A moved field
+    \\    // has to fail here rather than send the walk off the header.
+    \\    if (@offsetOf(std.elf.Elf64.Ehdr, "phoff") != 32 or
+    \\        @offsetOf(std.elf.Elf64.Ehdr, "phentsize") != 54 or
+    \\        @offsetOf(std.elf.Elf64.Ehdr, "phnum") != 56)
+    \\        @compileError("the 64-bit ELF header's program-header fields moved");
+    \\    if (@offsetOf(std.elf.Elf32.Ehdr, "phoff") != 28 or
+    \\        @offsetOf(std.elf.Elf32.Ehdr, "phentsize") != 42 or
+    \\        @offsetOf(std.elf.Elf32.Ehdr, "phnum") != 44)
+    \\        @compileError("the 32-bit ELF header's program-header fields moved");
+    \\    if (@offsetOf(std.elf.Elf64.Phdr, "type") != 0 or
+    \\        @offsetOf(std.elf.Elf64.Phdr, "offset") != 8 or
+    \\        @offsetOf(std.elf.Elf64.Phdr, "vaddr") != 16 or
+    \\        @offsetOf(std.elf.Elf64.Phdr, "filesz") != 32 or
+    \\        @offsetOf(std.elf.Elf32.Phdr, "offset") != 4 or
+    \\        @offsetOf(std.elf.Elf32.Phdr, "vaddr") != 8 or
+    \\        @offsetOf(std.elf.Elf32.Phdr, "filesz") != 16)
+    \\        @compileError("an ELF program header's fields moved");
+    \\    if (@offsetOf(std.elf.Elf64_Dyn, "d_tag") != 0 or
+    \\        @offsetOf(std.elf.Elf64_Dyn, "d_val") != 8 or
+    \\        @offsetOf(std.elf.Elf32_Dyn, "d_tag") != 0 or
+    \\        @offsetOf(std.elf.Elf32_Dyn, "d_val") != 4)
+    \\        @compileError("an ELF dynamic entry's fields moved");
     \\}
     \\
     \\/// Every refusal this program can make and nothing else, so a reader of
@@ -1459,6 +1627,21 @@ const elf_check_source =
     \\        WrongElfData,
     \\        WrongElfOsAbi,
     \\        WrongElfMachine,
+    \\        // The three that make this gate able to refuse a host artefact.
+    \\        // `MissingLibcNeeded` and `WrongElfInterpreter` are the two
+    \\        // checks `e_machine` could not make: on x86_64 a host glibc PIE
+    \\        // carries the same e_machine, EI_CLASS, EI_DATA and EI_OSABI as a
+    \\        // bionic one, so the header alone accepts it and this gate used to.
+    \\        //
+    \\        // `NotBionic` is the umbrella a future check would use; it is
+    \\        // declared so the set keeps naming the class of refusal, and every
+    \\        // current bionic check returns the more specific member above it.
+    \\        NotBionic,
+    \\        TruncatedProgramHeaders,
+    \\        NoDynamicSegment,
+    \\        UnreadableDynamicString,
+    \\        MissingLibcNeeded,
+    \\        WrongElfInterpreter,
     \\    };
     \\
     \\pub fn main(init: std.process.Init) CheckError!void {
@@ -1473,7 +1656,7 @@ const elf_check_source =
     \\        std.log.err(
     \\            "ndk-elf-check was invoked with no path to check. The artefact " ++
     \\                "path is the LAST argument, after the flags:\n  " ++
-    \\                "  ndk-elf-check --abi <dir> --class <EI_CLASS> " ++
+    \\                "  ndk-elf-check --abi <name> --class <EI_CLASS> " ++
     \\                "--machine <e_machine> [--gate <row>...] <path>",
     \\            .{},
     \\        );
@@ -1531,7 +1714,7 @@ const elf_check_source =
     \\        if (i + 1 >= flags.len) {
     \\            std.log.err(
     \\                "'{s}' was given with no value. Every flag takes one:\n  " ++
-    \\                    "  ndk-elf-check --abi <dir> --class <EI_CLASS> " ++
+    \\                    "  ndk-elf-check --abi <name> --class <EI_CLASS> " ++
     \\                    "--machine <e_machine> [--gate <row>...] <path>",
     \\                .{flag},
     \\            );
@@ -1588,12 +1771,32 @@ const elf_check_source =
     \\    };
     \\    defer file.close(io);
     \\
-    \\    var header: [e_header_len]u8 = undefined;
-    \\    const chunks = [_][]u8{&header};
-    \\    const read = file.readStreaming(io, &chunks) catch |err| {
+    \\    // The file is read WHOLE, not just its first twenty bytes. The
+    \\    // bionic checks below live in the program headers and the dynamic
+    \\    // segment, which is past everything the old header-only read ever
+    \\    // looked at, and that is the whole reason it accepted a host glibc
+    \\    // binary for x86_64. Read the magic and the header from the front of
+    \\    // this buffer rather than from a separate read, so there is one
+    \\    // description of where the bytes came from.
+    \\    const stat = file.stat(io) catch |err| {
+    \\        std.log.err("the link gate installed '{s}', whose size cannot be read: {t}", .{ path, err });
+    \\        return error.ArtefactUnreadable;
+    \\    };
+    \\    if (stat.size > max_artefact_bytes) {
+    \\        std.log.err(
+    \\            "the link gate installed '{s}', which is {d} bytes: past the " ++
+    \\                "{d}-byte ceiling this checker reads, so nothing about it " ++
+    \\                "was verified",
+    \\            .{ path, stat.size, max_artefact_bytes },
+    \\        );
+    \\        return error.ArtefactUnreadable;
+    \\    }
+    \\    const bytes = gpa.alloc(u8, @intCast(stat.size)) catch return error.OutOfMemory;
+    \\    const read = file.readPositionalAll(io, bytes, 0) catch |err| {
     \\        std.log.err("the link gate installed '{s}', which cannot be read: {t}", .{ path, err });
     \\        return error.ArtefactUnreadable;
     \\    };
+    \\    const header = bytes[0..];
     \\
     \\    // The magic check is the one this gate has always made and it stays
     \\    // first, unchanged: a file that is not an ELF at all has nothing else
@@ -1607,12 +1810,17 @@ const elf_check_source =
     \\        );
     \\        return error.NotAnElfFile;
     \\    }
-    \\    if (read < e_header_len) {
+    \\    const header_len: usize = if (expected_class == 1) e_header_len_32 else e_header_len;
+    \\    if (read < header_len) {
     \\        std.log.err(
-    \\            "the link gate produced '{s}', whose ELF header ends early: read {d} of " ++
-    \\                "the {d} bytes that e_ident, e_type and e_machine need, so no ABI " ++
-    \\                "can be read out of it",
-    \\            .{ path, read, e_header_len },
+    \\            "the link gate produced '{s}', whose {s}-class ELF header ends early: " ++
+    \\                "read {d} of the {d} bytes it needs, so no ABI can be read out of it",
+    \\            .{
+    \\                path,
+    \\                className(expected_class),
+    \\                read,
+    \\                header_len,
+    \\            },
     \\        );
     \\        return error.TruncatedElfHeader;
     \\    }
@@ -1718,6 +1926,233 @@ const elf_check_source =
     \\        );
     \\        return error.WrongElfMachine;
     \\    }
+    \\
+    \\    // ------------------------------------------------------------------
+    \\    // The bionic checks. These are what `e_machine` cannot do.
+    \\    //
+    \\    // On x86_64 a host glibc PIE and a bionic x86_64 binary agree on
+    \\    // e_machine (62), EI_CLASS (2), EI_DATA (1) and EI_OSABI (0), so
+    \\    // everything above passes for both and this gate used to accept the
+    \\    // host binary. What separates them is after the header: bionic's
+    \\    // soname is `libc.so` and glibc's is `libc.so.6`, and the Android
+    \\    // interpreter is under /system/bin while a host one is under the
+    \\    // glibc store path. Both are checked, and both are NOT per-ABI: the
+    \\    // soname is the same string for all five, and the interpreter is
+    \\    // decided by EI_CLASS, which the check above already tied to the ABI
+    \\    // row. So nothing here is a second ABI table.
+    \\    // ------------------------------------------------------------------
+    \\    const is_64 = expected_class == 2;
+    \\    const phdr_size: usize = if (is_64) @sizeOf(std.elf.Elf64.Phdr) else @sizeOf(std.elf.Elf32.Phdr);
+    \\    const phoff = readField(header, @offsetOf(std.elf.Elf64.Ehdr, "phoff"), @offsetOf(std.elf.Elf32.Ehdr, "phoff"), is_64);
+    \\    const phentsize = readHalf(header, @offsetOf(std.elf.Elf64.Ehdr, "phentsize"), @offsetOf(std.elf.Elf32.Ehdr, "phentsize"), is_64);
+    \\    const phnum = readHalf(header, @offsetOf(std.elf.Elf64.Ehdr, "phnum"), @offsetOf(std.elf.Elf32.Ehdr, "phnum"), is_64);
+    \\    if (phentsize != phdr_size) {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose e_phentsize is {d}, not the {d} " ++
+    \\                "bytes a {s}-class program header is: the program headers " ++
+    \\                "cannot be walked, so nothing after the ELF header was checked",
+    \\            .{ path, phentsize, phdr_size, className(expected_class) },
+    \\        );
+    \\        return error.TruncatedProgramHeaders;
+    \\    }
+    \\    const phdr_bytes = phnum * phentsize;
+    \\    if (phoff + phdr_bytes > bytes.len) {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose {d} program headers at offset " ++
+    \\                "{d} run past its {d} bytes: they cannot be walked, so nothing " ++
+    \\                "after the ELF header was checked",
+    \\            .{ path, phnum, phoff, bytes.len },
+    \\        );
+    \\        return error.TruncatedProgramHeaders;
+    \\    }
+    \\
+    \\    // `PT_INTERP` names the program interpreter, and `PT_DYNAMIC` is where
+    \\    // the DT_NEEDED entries live. Both are file offsets, so both can be
+    \\    // read straight out of the buffer already in hand.
+    \\    var interp: ?[]const u8 = null;
+    \\    var dynamic: ?struct { off: u64, len: u64 } = null;
+    \\    {
+    \\        var ph: u64 = 0;
+    \\        while (ph < phnum) : (ph += 1) {
+    \\            const at: usize = @intCast(phoff + ph * phentsize);
+    \\            const phdr = bytes[at..][0..phentsize];
+    \\            const kind = readWord32(phdr, @offsetOf(std.elf.Elf64.Phdr, "type"));
+    \\            const off = readField(phdr, @offsetOf(std.elf.Elf64.Phdr, "offset"), @offsetOf(std.elf.Elf32.Phdr, "offset"), is_64);
+    \\            const filesz = readField(phdr, @offsetOf(std.elf.Elf64.Phdr, "filesz"), @offsetOf(std.elf.Elf32.Phdr, "filesz"), is_64);
+    \\            if (off + filesz > bytes.len) continue;
+    \\            const body = bytes[@intCast(off)..][0..@intCast(filesz)];
+    \\            if (kind == std.elf.PT_INTERP and interp == null) {
+    \\                // The interpreter string is NUL-terminated and `filesz`
+    \\                // includes that NUL, so the slice is trimmed rather than
+    \\                // trusted to be exact.
+    \\                interp = std.mem.trimEnd(u8, body, "\x00");
+    \\            } else if (kind == std.elf.PT_DYNAMIC and dynamic == null) {
+    \\                dynamic = .{ .off = off, .len = filesz };
+    \\            }
+    \\        }
+    \\    }
+    \\
+    \\    // Android's own linker, and nothing else. `/system/bin/linker` for the
+    \\    // two 32-bit ABIs and `/system/bin/linker64` for the three 64-bit
+    \\    // ones, so this is decided by the class the header already committed
+    \\    // to above rather than by a per-ABI table this file would have to keep
+    \\    // in step with `abi_gates`.
+    \\    const want_interp: []const u8 = if (is_64) "/system/bin/linker64" else "/system/bin/linker";
+    \\    const got_interp = interp orelse {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', which has no PT_INTERP segment: " ++
+    \\                "every dynamically linked Android binary is loaded by {s}, " ++
+    \\                "and a file with no interpreter is not one",
+    \\            .{ path, want_interp },
+    \\        );
+    \\        return error.WrongElfInterpreter;
+    \\    };
+    \\    if (!std.mem.eql(u8, got_interp, want_interp)) {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose PT_INTERP names '{s}', but " ++
+    \\                "-Dabi={s} builds a {s}-class Android binary loaded by {s}: " ++
+    \\                "this artefact is not loaded by the Android linker",
+    \\            .{ path, got_interp, abi, className(expected_class), want_interp },
+    \\        );
+    \\        return error.WrongElfInterpreter;
+    \\    }
+    \\
+    \\    // `libc.so` exactly. bionic's soname carries no version suffix and
+    \\    // glibc's carries `.6`, so this one string separates the two libcs with
+    \\    // no ambiguity and no per-ABI field.
+    \\    const want_needed = "libc.so";
+    \\    const seg = dynamic orelse {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', which has no PT_DYNAMIC segment: " ++
+    \\                "a binary linked against {s} always has one, so its " ++
+    \\                "DT_NEEDED entries cannot be read and this run proved nothing",
+    \\            .{ path, want_needed },
+    \\        );
+    \\        return error.NoDynamicSegment;
+    \\    };
+    \\    if (!hasNeeded(bytes, seg.off, seg.len, is_64, want_needed)) {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose DT_NEEDED entries do not " ++
+    \\                "include {s}: -Dabi={s} builds a binary linked against " ++
+    \\                "Android bionic, whose libc soname is {s}. A host binary " ++
+    \\                "linked against glibc carries the same e_machine, EI_CLASS, " ++
+    \\                "EI_DATA and EI_OSABI on x86_64 and is told apart here",
+    \\            .{ path, want_needed, abi, want_needed },
+    \\        );
+    \\        return error.MissingLibcNeeded;
+    \\    }
+    \\
+    \\    // The one success line. A gate that says nothing when it passes leaves
+    \\    // no record, which is how a matrix run over five ABIs ends with one
+    \\    // ambiguous artefact and no way to tell the other four were checked.
+    \\    std.debug.print(
+    \\        "ndk-elf-check: {s} OK: EI_CLASS {d}, e_machine {s} ({d}), " ++
+    \\            "PT_INTERP {s}, DT_NEEDED {s}; {s}\n",
+    \\        .{ abi, expected_class, machineName(expected_machine), expected_machine, want_interp, want_needed, path },
+    \\    );
+    \\}
+    \\
+    \\/// One 32-bit field of an ELF program header, at `at`. `p_type` is 32
+    \\/// bits in BOTH classes, so reading it eight bytes wide folds the
+    \\/// `p_flags` word into the value and no program header compares equal to
+    \\/// the type it carries — which is a program-header walk that finds
+    \\/// nothing and then says so about a perfectly good binary.
+    \\fn readWord32(buf: []const u8, at: usize) u64 {
+    \\        return std.mem.readInt(u32, buf[at..][0..4], .little);
+    \\    }
+    \\
+    \\/// One 16-bit `Half` field of an ELF header, at whichever offset the
+    \\/// class puts it.
+    \\///
+    \\/// Its own reader because these are `Half`: reading them through
+    \\/// `readField` takes eight bytes where the field is two, which returns a
+    \\/// plausible wrong number rather than failing — an `e_phentsize` of
+    \\/// 10414849016987704 is what that reads out of a real Android binary.
+    \\/// The offsets differ between the classes as well: `e_phentsize` is 54 in
+    \\/// `Elf64.Ehdr` and 42 in `Elf32.Ehdr`, so one offset for both classes
+    \\/// reads a zero out of every 32-bit binary this gate is asked about.
+    \\fn readHalf(buf: []const u8, off64: usize, off32: usize, is_64: bool) u64 {
+    \\        const at = if (is_64) off64 else off32;
+    \\        return std.mem.readInt(std.elf.Half, buf[at..][0..2], .little);
+    \\    }
+    \\
+    \\/// One unsigned field of an ELF header or program header, read in
+    \\/// whichever width the class implies and from whichever offset it puts
+    \\/// the field.
+    \\///
+    \\/// BOTH offsets are passed rather than one, because the 32-bit and 64-bit
+    \\/// layouts place the same field at DIFFERENT offsets: `e_phoff` is 32 in
+    \\/// `Elf64.Ehdr` and 28 in `Elf32.Ehdr`, and a program header's `p_offset`
+    \\/// is 8 and 4. Reading the 64-bit offset out of a 32-bit file does not
+    \\/// fail — it returns a plausible wrong number, and that is how this gate
+    \\/// came to believe a real Android binary declared an `e_phentsize` of
+    \\/// 10414849016987704.
+    \\fn readField(buf: []const u8, off64: usize, off32: usize, is_64: bool) u64 {
+    \\        if (is_64) return std.mem.readInt(u64, buf[off64..][0..8], .little);
+    \\        return std.mem.readInt(u32, buf[off32..][0..4], .little);
+    \\    }
+    \\
+    \\/// Whether the dynamic segment at `off` carries a `DT_NEEDED` naming
+    \\/// exactly `want`.
+    \\///
+    \\/// A `DT_NEEDED` value is an OFFSET into the string table `DT_STRTAB`
+    \\/// points at, and `DT_STRTAB` is a VIRTUAL ADDRESS, so this walks the
+    \\/// dynamic entries twice: once to find the string table's address, once
+    \\/// to resolve the names. The address becomes a file offset through the
+    \\/// `PT_LOAD` segment holding it, which is the one mapping step needed and
+    \\/// is why `vaddr` is read at all.
+    \\fn hasNeeded(bytes: []const u8, off: u64, len: u64, is_64: bool, want: []const u8) bool {
+    \\        const entry_size: usize = if (is_64) @sizeOf(std.elf.Elf64_Dyn) else @sizeOf(std.elf.Elf32_Dyn);
+    \\        if (off + len > bytes.len or len < entry_size) return false;
+    \\        const seg = bytes[@intCast(off)..][0..@intCast(len)];
+    \\
+    \\        var strtab_vaddr: ?u64 = null;
+    \\        var count: usize = 0;
+    \\        while (count + entry_size <= seg.len) : (count += entry_size) {
+    \\            const e = seg[count..][0..entry_size];
+    \\            const tag = readField(e, @offsetOf(std.elf.Elf64_Dyn, "d_tag"), @offsetOf(std.elf.Elf32_Dyn, "d_tag"), is_64);
+    \\            const val = readField(e, @offsetOf(std.elf.Elf64_Dyn, "d_val"), @offsetOf(std.elf.Elf32_Dyn, "d_val"), is_64);
+    \\            if (tag == std.elf.DT_NULL) break;
+    \\            if (tag == std.elf.DT_STRTAB) strtab_vaddr = val;
+    \\        }
+    \\        const strtab = strtab_vaddr orelse return false;
+    \\        const strtab_off = vaddrToOffset(bytes, strtab, is_64) orelse return false;
+    \\
+    \\        count = 0;
+    \\        while (count + entry_size <= seg.len) : (count += entry_size) {
+    \\            const e = seg[count..][0..entry_size];
+    \\            const tag = readField(e, @offsetOf(std.elf.Elf64_Dyn, "d_tag"), @offsetOf(std.elf.Elf32_Dyn, "d_tag"), is_64);
+    \\            const val = readField(e, @offsetOf(std.elf.Elf64_Dyn, "d_val"), @offsetOf(std.elf.Elf32_Dyn, "d_val"), is_64);
+    \\            if (tag == std.elf.DT_NULL) break;
+    \\            if (tag != std.elf.DT_NEEDED) continue;
+    \\            const name_at = strtab_off + val;
+    \\            if (name_at >= bytes.len) continue;
+    \\            const rest = bytes[@intCast(name_at)..];
+    \\            const end = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+    \\            if (std.mem.eql(u8, rest[0..end], want)) return true;
+    \\        }
+    \\        return false;
+    \\    }
+    \\
+    \\/// The file offset a virtual address sits at, through the `PT_LOAD`
+    \\/// segment that contains it.
+    \\fn vaddrToOffset(bytes: []const u8, vaddr: u64, is_64: bool) ?u64 {
+    \\        const phoff = readField(bytes, @offsetOf(std.elf.Elf64.Ehdr, "phoff"), @offsetOf(std.elf.Elf32.Ehdr, "phoff"), is_64);
+    \\        const phentsize = readHalf(bytes, @offsetOf(std.elf.Elf64.Ehdr, "phentsize"), @offsetOf(std.elf.Elf32.Ehdr, "phentsize"), is_64);
+    \\        const phnum = readHalf(bytes, @offsetOf(std.elf.Elf64.Ehdr, "phnum"), @offsetOf(std.elf.Elf32.Ehdr, "phnum"), is_64);
+    \\        var i: u64 = 0;
+    \\        while (i < phnum) : (i += 1) {
+    \\            const at: usize = @intCast(phoff + i * phentsize);
+    \\            if (at + phentsize > bytes.len) return null;
+    \\            const ph = bytes[at..][0..@intCast(phentsize)];
+    \\            if (readWord32(ph, @offsetOf(std.elf.Elf64.Phdr, "type")) != std.elf.PT_LOAD) continue;
+    \\            const seg_off = readField(ph, @offsetOf(std.elf.Elf64.Phdr, "offset"), @offsetOf(std.elf.Elf32.Phdr, "offset"), is_64);
+    \\            const seg_vaddr = readField(ph, @offsetOf(std.elf.Elf64.Phdr, "vaddr"), @offsetOf(std.elf.Elf32.Phdr, "vaddr"), is_64);
+    \\            const seg_filesz = readField(ph, @offsetOf(std.elf.Elf64.Phdr, "filesz"), @offsetOf(std.elf.Elf32.Phdr, "filesz"), is_64);
+    \\            if (vaddr < seg_vaddr or vaddr >= seg_vaddr + seg_filesz) continue;
+    \\            return seg_off + (vaddr - seg_vaddr);
+    \\        }
+    \\        return null;
     \\}
     \\
     \\fn tagName(comptime E: type, value: E) []const u8 {
@@ -1748,7 +2183,7 @@ const elf_check_source =
     \\    fn missingExpectation(flag: []const u8) CheckError {
     \\        std.log.err(
     \\            "no {s} was given, and all three expectations are required:\n  " ++
-    \\                "  ndk-elf-check --abi <dir> --class <EI_CLASS> " ++
+    \\                "  ndk-elf-check --abi <name> --class <EI_CLASS> " ++
     \\                "--machine <e_machine> [--gate <row>...] <path>\n" ++
     \\                "  build.zig writes all three from one AbiGate row, so a " ++
     \\                "missing one is a bug in this package's own wiring.",
@@ -1878,7 +2313,7 @@ const libc_file_helper_source =
     \\    const body = args[1 .. args.len - 1];
     \\
     \\    var ndk_root: ?[]const u8 = null;
-    \\    var abi_directory: ?[]const u8 = null;
+    \\    var abi_name: ?[]const u8 = null;
     \\    var api_level: u32 = 0;
     \\    var gates: std.ArrayList([7][]const u8) = .empty;
     \\    defer gates.deinit(gpa);
@@ -1937,7 +2372,7 @@ const libc_file_helper_source =
     \\        if (std.mem.eql(u8, flag, "--ndk")) {
     \\            ndk_root = value;
     \\        } else if (std.mem.eql(u8, flag, "--abi")) {
-    \\            abi_directory = value;
+    \\            abi_name = value;
     \\        } else if (std.mem.eql(u8, flag, "--api")) {
     \\            api_level = std.fmt.parseInt(u32, value, 10) catch {
     \\                std.log.err(
@@ -1974,7 +2409,7 @@ const libc_file_helper_source =
     \\        );
     \\        return error.MissingNdkRoot;
     \\    };
-    \\    const wanted = abi_directory orelse {
+    \\    const wanted = abi_name orelse {
     \\        std.log.err(
     \\            "no --abi was given, so there is no ABI to build a libc paths " ++
     \\                "file for:\n  " ++
@@ -1988,7 +2423,7 @@ const libc_file_helper_source =
     \\    const abi = abiByName(wanted) orelse {
     \\        std.log.err(
     \\            "the zig-ndk module has no ABI named '{s}'. The names it does " ++
-    \\                "carry are {s}, and that list is `zig_ndk.abi_directory_names` " ++
+    \\                "carry are {s}, and that list is `zig_ndk.abi_names` " ++
     \\                "in this package's build half: -Dabi= (and `.abi`) take one " ++
     \\                "of them and nothing else is guessed at.",
     \\            .{ wanted, try abiNameList(gpa) },
@@ -2014,7 +2449,7 @@ const libc_file_helper_source =
     \\
     \\    const host = ndk.Ndk.hostTag(builtin.target) catch |err| {
     \\        // The same text tools/sync-ndk.sh prints for the same condition
-    \\        // (tools/sync-ndk.sh:245-250), because the two refuse the same host
+    \\        // (tools/sync-ndk.sh:286-293), because the two refuse the same host
     \\        // for the same reason. No path is offered: this error is not a claim
     \\        // about any path, so offering one would blame the reader for
     \\        // something they cannot change. `build()` refuses this case before
@@ -2063,9 +2498,9 @@ const libc_file_helper_source =
     \\            std.log.err(
     \\                "'{s}' could not be probed as an Android NDK: {t}\n" ++
     \\                    "  That is a filesystem failure, not a statement about " ++
-    \\                    "  what the path contains. Check that the path exists, " ++
+    \\                    "what the path contains. Check that the path exists, " ++
     \\                    "that it is a directory rather than a file, and that " ++
-    \\                    "  this user can read and traverse it.",
+    \\                    "this user can read and traverse it.",
     \\                .{ root, err },
     \\            );
     \\        }
@@ -2155,12 +2590,9 @@ const libc_file_helper_source =
     \\    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = contents.written() });
     \\}
     \\
-    \\fn abiByName(name: []const u8) ?ndk.Abi {
-    \\    for (std.enums.values(ndk.Abi)) |candidate| {
-    \\        if (std.mem.eql(u8, candidate.name(), name)) return candidate;
+    \\    fn abiByName(name: []const u8) ?ndk.Abi {
+    \\        return ndk.Abi.fromName(name);
     \\    }
-    \\    return null;
-    \\}
     \\
     \\fn expectPath(io: std.Io, path: []const u8) !void {
     \\    std.Io.Dir.cwd().access(io, path, .{}) catch |err| {

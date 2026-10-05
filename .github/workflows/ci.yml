@@ -105,13 +105,6 @@ env:
   # description this gate exists to check. Per-ABI minimums wired without this
   # produce a red CI nobody can explain.
 
-  # Repo-local, and already in .gitignore. This is the absolute form of the
-  # same directory devenv.nix pins, spelled out because a relative value
-  # resolves against whatever directory the command runs from: a build run
-  # from a subdirectory would land back in the shared global cache, which is
-  # the lock convoy this pin exists to keep CI off.
-  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-
   # --- Compiler record for the pinned Android NDK -------------------------
   # Facts about one artefact, not choices. Each of the three constants below is
   # a fact tools/ndk.sha256 pins, and that file re-resolves all five of its own
@@ -154,6 +147,12 @@ env:
 #    The SHA is the pin. The `# v4` / `# v2` beside it is a label, and
 #    .github/dependabot.yml is what proposes the next SHA before a pin can
 #    outlive the release it names.
+#    What the SHA does not pin is the Node major those actions execute on. All
+#    three pinned SHAs declare `using: 'node20'`, and the runner's own
+#    Node20RemovalDate of 2026-09-23 has passed, so the runner now
+#    force-upgrades them to node24 and annotates the run rather than failing
+#    it. The jobs still run, on a runtime no line in this file names or
+#    controls.
 #
 # 2. Every checkout passes `persist-credentials: false`. By default the action
 #    writes GITHUB_TOKEN into .git/config as an http extraheader and leaves it
@@ -193,12 +192,34 @@ jobs:
       - name: Pin the Zig cache to the repo-local directory
         run: |
           set -euo pipefail
-          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-          # setup-zig unconditionally exportVariable()s
-          # ZIG_GLOBAL_CACHE_DIR=<workspace>/.zig-cache (main.js:186), and a
-          # GITHUB_ENV write outranks the workflow `env:` block. Re-export ours
-          # so the gate uses the same directory devenv.nix names.
-          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+          # The value is SPELLED here rather than read from the environment,
+          # and that is the whole fix. setup-zig unconditionally
+          # exportVariable()s ZIG_GLOBAL_CACHE_DIR=<workspace>/.zig-cache
+          # (main.js:186, common.js:205-207), and a GITHUB_ENV write outranks
+          # the workflow `env:` block: JobExtension.cs:240-248 seeds
+          # Global.EnvironmentVariables from `env:` at job start,
+          # FileCommandManager.cs:198-213 then overwrites that same dictionary
+          # from each GITHUB_ENV file, and StepsRunner.cs:106-112 rebuilds each
+          # step's environment from it. So by the time this step runs,
+          # $ZIG_GLOBAL_CACHE_DIR is ALREADY setup-zig's .zig-cache, and
+          # echoing "${ZIG_GLOBAL_CACHE_DIR}" re-exported that same .zig-cache
+          # under our own name: the step undid the thing it exists to do and
+          # stayed green while doing it.
+          #
+          # There is deliberately no ZIG_GLOBAL_CACHE_DIR in the workflow
+          # `env:` block any more. Two spellings of one variable, of which one
+          # is overwritten before any step can read it, is how the next reader
+          # comes to trust the dead one. This step is the only place the value
+          # is written; the actions/cache step below reads it back through its
+          # `path` input.
+          #
+          # Repo-local, absolute, and already in .gitignore — the same
+          # directory devenv.nix pins. Absolute because a relative value
+          # resolves against whatever directory the command runs from, so a
+          # build from a subdirectory would land back in the shared global
+          # cache, which is the lock convoy this pin exists to keep CI off.
+          mkdir -p "$GITHUB_WORKSPACE/.zig-global-cache"
+          echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache" >> "$GITHUB_ENV"
 
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -210,11 +231,15 @@ jobs:
       - name: Format gate
         run: zig build fmt-check
 
-  # ---------------------------------------------------------------------------
   # Hard requirement of the package design: a consumer who has no NDK
   # installed, and sets no ANDROID_NDK_* variable, must still be able to build
-  # and run the host tests. So this job provisions no NDK and asserts nothing
-  # about one — a green run here is the evidence that the sysroot is optional.
+  # and run the host tests. So this job provisions no NDK — and it now ASSERTS
+  # that it did not inherit one, which is the difference between proving the
+  # sysroot is optional and merely being green on a machine that happens to
+  # have none. Without the assertion this job cannot tell those two apart: a
+  # self-hosted runner, or a future BASH_ENV edit, could export
+  # ANDROID_NDK_HOME and the tests would go on passing against a sysroot,
+  # which is evidence for the opposite of what this gate claims.
   test:
     name: test (host, no NDK)
     runs-on: ubuntu-latest
@@ -234,8 +259,23 @@ jobs:
       - name: Pin the Zig cache to the repo-local directory
         run: |
           set -euo pipefail
-          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/.zig-global-cache"
+          echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache" >> "$GITHUB_ENV"
+
+      # The precondition, asserted rather than assumed. Without this step a
+      # green run here cannot be told apart from a run on a machine that
+      # happened to export an NDK, which is evidence for the opposite of what
+      # this gate claims; it runs before the test step for that reason.
+      # `:-` treats an unset and an empty variable identically, and the three
+      # are concatenated with no separator because any one of them being
+      # non-empty is already enough to fail.
+      - name: Assert no ANDROID_NDK_* variable is set
+        run: |
+          set -euo pipefail
+          test -z "${ANDROID_NDK_HOME:-}${ANDROID_NDK_ROOT:-}${ANDROID_NDK:-}" || {
+            echo "::error::this job asserts an NDK-free environment (found ANDROID_NDK_HOME='${ANDROID_NDK_HOME:-}' ANDROID_NDK_ROOT='${ANDROID_NDK_ROOT:-}' ANDROID_NDK='${ANDROID_NDK:-}'); its green run would not prove the sysroot is optional"
+            exit 1
+          }
 
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -267,8 +307,8 @@ jobs:
       - name: Pin the Zig cache to the repo-local directory
         run: |
           set -euo pipefail
-          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/.zig-global-cache"
+          echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache" >> "$GITHUB_ENV"
 
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -342,8 +382,8 @@ jobs:
       - name: Pin the Zig cache to the repo-local directory
         run: |
           set -euo pipefail
-          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/.zig-global-cache"
+          echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache" >> "$GITHUB_ENV"
 
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -423,7 +463,7 @@ jobs:
       # gate with nothing left to say.
       #
       # A non-zero exit fails the job. This workflow sets `shell: bash`, which
-      # runs each block as `bash -e -o pipefail`, and no step here is marked to
+      # already supplies `-e -o pipefail`, and no step here is marked to
       # continue past a failure, so the script's exit status becomes the job's.
       - name: Assert the recorded NDK facts still describe this NDK
         run: zig build sync-ndk -Dndk="${ANDROID_NDK_HOME}"
@@ -537,19 +577,36 @@ jobs:
   # stay green there and break only for whoever fetches the package —
   #
   #   a consumer-facing name removed or renamed in root.zig or src/ndk.zig;
-  #   a file missing from build.zig.zon's `.paths`, which Build.path does not
-  #     detect, because it returns a LazyPath without touching the filesystem
-  #     and the failure waits for a step that needs it;
-  #   a .name or .fingerprint that satisfies this tree and no other;
+  #   a file missing from build.zig.zon's `.paths`;
   #   a renamed or re-signed pub declaration in the build half, which no
   #     in-tree caller can notice.
   #
-  # The consumer is written into the runner's temp directory by heredoc, never
-  # into this repository and never committed: there is no such directory in the
-  # tree, which is why you will not find one. Its dependency is a PATH to this
-  # checkout, so what it proves is the consuming build — manifest validation,
-  # the module registry, the published surface — and not the packaging: it
-  # cannot fetch from a URL, and this comment does not claim it can.
+  # The dependency is a URL to a tarball of this checkout, not a path to the
+  # checkout, and that is load-bearing rather than decorative. `manifest.paths`
+  # has exactly ONE consumer in the whole compiler — `unpackResource`
+  # (src/Package/Fetch.zig:748) — and the `.path` branch returns at
+  # src/Package/Fetch.zig:563-567, before reaching it. A path dependency is
+  # never filtered, by any path, so a `.paths` omission was invisible here
+  # even though it is the failure a real consumer hits first. Fetching through
+  # a URL runs the filter, and an omitted file then fails the build with
+  # `file_hash FileNotFound` on the very first compile.
+  #
+  # The fingerprint claim is deliberately NOT restated here, because the job
+  # does not uniquely catch it: `Fingerprint.validate` runs on manifest parse,
+  # so a wrong CHECKSUM half (crc32 of the name) turns `zig build` red in the
+  # fmt, test and cross jobs too, and a `.name` change turns red only because
+  # it invalidates that same crc32. What is genuinely unconstrained is the ID
+  # half: `validate` rejects it only when it is 0 or 0xffffffff
+  # (src/Package.zig:24-29), so any other value satisfies any tree, and
+  # build.zig.zon:11-13 already records the id half as opaque. No job in this
+  # file catches a wrong id half, and this comment does not claim one does.
+  #
+  # The tarball is packed from `git ls-files`, so it carries exactly the
+  # tracked tree and cannot be widened or narrowed by anything written to the
+  # working directory during the job. The consumer itself is written into the
+  # runner's temp directory by heredoc, never into this repository and never
+  # committed: there is no such directory in the tree, which is why you will
+  # not find one.
   #
   # Host target, no NDK, no sysroot, no 783 MB: the point is that a stranger can
   # depend on the package and call it, not that anything links.
@@ -572,8 +629,8 @@ jobs:
       - name: Pin the Zig cache to the repo-local directory
         run: |
           set -euo pipefail
-          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
-          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/.zig-global-cache"
+          echo "ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache" >> "$GITHUB_ENV"
 
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -589,11 +646,28 @@ jobs:
           rm -rf "$consumer"
           mkdir -p "$consumer/src"
 
-          # A path dependency, and it has to be RELATIVE: Zig 0.16 refuses an
-          # absolute one with "expected path relative to build root". The
-          # consumer lives in the runner's temp directory, so the relative path
-          # is computed rather than spelled.
-          dep="$(realpath --relative-to="$consumer" "$GITHUB_WORKSPACE")"
+          # A file:// URL dependency, which is what makes `.paths` mean
+          # something here: only a fetched package is unpacked through
+          # unpackResource, so only a fetched package is filtered. A path
+          # dependency returns before that code runs and would silently accept
+          # any `.paths` at all.
+          #
+          # Packed from the INDEX, not from the working tree, so the archive is
+          # exactly the tracked checkout: no untracked file left behind by a
+          # previous step can enter the package, and no `.gitignore`d
+          # directory (.zig-cache, zig-out) is swept in. `git ls-files -z` with
+          # `tar --null --files-from=-` is null-delimited, so a path containing
+          # a space or a newline cannot break the list apart.
+          package="$RUNNER_TEMP/zig_ndk-0.1.0.tar.gz"
+          git ls-files -z | tar czf "$package" --null --files-from=-
+
+          # `zig fetch` on the tarball both filters it through `.paths` and
+          # prints the hash of what survived, which is exactly the pair the
+          # consumer's manifest needs. The hash is computed here and never
+          # written down in this file: it changes with every edit to any listed
+          # file, and a committed copy would go stale and quietly turn this job
+          # into a check that some old tarball still fetches.
+          hash="$(zig fetch "file://$package")"
 
           cat >"$consumer/build.zig.zon" <<ZON
           .{
@@ -605,7 +679,7 @@ jobs:
               .fingerprint = 0x705b3727d964d897,
               .minimum_zig_version = "0.16.0",
               .dependencies = .{
-                  .zig_ndk = .{ .path = "$dep" },
+                  .zig_ndk = .{ .url = "file://$package", .hash = "$hash" },
               },
               .paths = .{ "build.zig", "build.zig.zon", "src" },
           }

@@ -340,6 +340,10 @@ if [ -z "$NDK_ROOT" ]; then
             printf '  %s. %-20s %s\n' "$((index + 2))" "$varname" \
                 "$(printf '%s' "${TRIED[$index]}" | tr '\n' '|')" >&2
         done
+        printf '  Give it an unpacked NDK two ways: --ndk <path>, or any of\n' >&2
+        printf '  ANDROID_NDK_HOME / ANDROID_NDK_ROOT / ANDROID_NDK above.\n' >&2
+        printf '  NDK_ZIP is not one of them: it names the published archive\n' >&2
+        printf '  to hash against the pin, not the tree to probe.\n' >&2
         exit 1
     fi
     NDK_ROOT=$FOUND
@@ -696,10 +700,10 @@ fi
 
 # --------------------------------------------------------------- ABI table ---
 #
-# Expected, straight from the NDK. Columns are <tag> <abi dir> <triple> <min
-# api>, where <tag> is the Zig identifier the enum spells and <abi dir> is the
-# directory name the NDK spells; keeping both means the diff reports a renamed
-# directory as well as a retargeted triple.
+# Expected, straight from the NDK. Columns are <tag> <abi name> <triple> <min
+# api>, where <tag> is the Zig identifier the enum spells and <abi name> is the
+# meta/abis.json key the NDK spells; keeping both means the diff reports a
+# renamed ABI as well as a retargeted triple.
 ABIS="$NDK_ROOT/meta/abis.json"
 [ -f "$ABIS" ] ||
     die "$ABIS not found; r29 and later ship it, and without it there is nothing to diff"
@@ -736,7 +740,7 @@ fi
 
 if jq -e 'all(.[]; has("min_os_version"))' "$ABIS" >/dev/null 2>&1; then
     MIN_OS_PRESENT=1
-    COLUMNS_DESC="<tag> <abi dir> <triple> <min api>"
+    COLUMNS_DESC="<tag> <abi name> <triple> <min api>"
 elif jq -e 'any(.[]; has("min_os_version"))' "$ABIS" >/dev/null 2>&1; then
     printf 'sync-ndk: %s carries min_os_version on some ABIs and not others.\n' "$ABIS" >&2
     printf 'A partial floor table has no value to compare and no honest reading\n' >&2
@@ -757,7 +761,7 @@ else
         exit 1
     fi
     MIN_OS_PRESENT=0
-    COLUMNS_DESC="<tag> <abi dir> <triple>"
+    COLUMNS_DESC="<tag> <abi name> <triple>"
 fi
 
 if [ "$MIN_OS_PRESENT" -eq 1 ]; then
@@ -787,7 +791,7 @@ awk -v tagfile="$WORK/declared.tsv" -v blindfile="$WORK/blind.txt" '
     /^\};/                     { in_abi = 0; next }
     in_abi == 0                { next }
     /^[[:space:]]*\/\//        { next }
-    /^[[:space:]]*pub fn name\(/             { mode = "dir";  next }
+    /^[[:space:]]*pub fn name\(/             { mode = "name";  next }
     /^[[:space:]]*pub fn triple\(/           { mode = "trip"; next }
     /^[[:space:]]*pub fn minApiLevel\(/      { mode = "min";  next }
     /^\}/                      { mode = "";      next }
@@ -825,7 +829,7 @@ awk -v tagfile="$WORK/declared.tsv" -v blindfile="$WORK/blind.txt" '
             sub(/[[:space:]]*$/, "", tag)
             if (tag == "") continue
             seen[tag] = 1
-            if (mode == "dir")  dir[tag]  = value
+            if (mode == "name") name[tag] = value
             if (mode == "trip") trip[tag] = value
             if (mode == "min")  min[tag]  = value
         }
@@ -836,8 +840,8 @@ awk -v tagfile="$WORK/declared.tsv" -v blindfile="$WORK/blind.txt" '
             # counts still match, so a renamed accessor came out as a blank
             # column and was then reported as NDK drift for an edit made in
             # this repository. Named here instead, before anything is compared.
-            if (dir[tag] == "" || trip[tag] == "" || min[tag] == "") print tag > blindfile
-            printf "%s\t%s\t%s\t%s\n", tag, dir[tag], trip[tag], min[tag]
+            if (name[tag] == "" || trip[tag] == "" || min[tag] == "") print tag > blindfile
+            printf "%s\t%s\t%s\t%s\n", tag, name[tag], trip[tag], min[tag]
         }
         for (declared_tag in declared) print declared_tag > tagfile
         close(tagfile)
@@ -888,7 +892,7 @@ else
     if [ "$MIN_OS_PRESENT" -eq 1 ]; then
         printf 'abi table: %s ABIs in src/ndk.zig match meta/abis.json exactly\n' "$ACTUAL_COUNT"
     else
-        printf 'abi table: %s ABIs in src/ndk.zig match meta/abis.json on tag, directory and triple\n' "$ACTUAL_COUNT"
+        printf 'abi table: %s ABIs in src/ndk.zig match meta/abis.json on tag, name and triple\n' "$ACTUAL_COUNT"
     fi
 fi
 
