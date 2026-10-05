@@ -1,0 +1,25 @@
+.{
+    .name = .zig_ndk,
+    .version = "0.1.0",
+    // Zig 0.16.0 Package.Fingerprint is `packed struct(u64) { id: u32,
+    // checksum: u32 }` (src/Package.zig:9-30) and `validate` requires
+    // `checksum == std.hash.Crc32.hash(name)`. `name` is the `.name` enum
+    // literal token (src/Package/Manifest.zig:387-404), i.e. "zig_ndk".
+    // crc32("zig_ndk") == 0xdb4b4a79, which is the high half below; the low
+    // half is the random `id` from `Fingerprint.generate`.
+    .fingerprint = 0xdb4b4a79be9224ab,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "root.zig",
+        "src",
+        "test",
+        "README.md",
+        "LICENSE",
+        "CHANGELOG.md",
+        "CONTRACT.md",
+        "tools",
+    },
+}
