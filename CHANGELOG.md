@@ -13,24 +13,40 @@ moves. Two things follow from that, and they are the whole discipline:
   names its enforcer, or it says in plain words that nothing enforces it and
   names the event that would.
 - **Entries are invalidated by two different things.** The NDK entries move when
-  Google ships r30. The compiler entries move when Zig ships 0.17. A single
-  bump often touches both, and conflating them is how a stale fact survives a
-  review.
+  Google ships a new NDK. The compiler entries move when Zig ships a new Zig. A
+  single bump often touches both, and conflating them is how a stale fact
+  survives a review.
+
+**Both of those triggers have already fired, and neither has been actioned.**
+That is the single most important line in this file, so it is stated here
+rather than left for a reader to infer from the pin below:
+
+| Trigger | Fired | What is still true |
+|---|---|---|
+| Zig **0.17.0** | shipped **2026-10-01**, Codeberg tag `7647adab80dd088f4de3610fd245915a912eb6ad` | This package is developed and verified against **0.16.0**. Every `file:line` citation in this repository is anchored to 0.16.0 and **nothing here has been re-verified against 0.17**. `.minimum_zig_version = "0.16.0"` remains valid — it is a floor, not a pin — but it is advisory, so it would not have refused a 0.17 build. |
+| NDK **r30** (`30.0.16248370`) | shipped **2026-09-08** | This package is verified against **r29 only**, which is now the first entry on Google's unsupported-downloads list. Nothing here was read from r30. The bump is expected to be cheap: r30 relocates nothing, the five `meta/abis.json` keys and triples are unchanged, and `Ndk.apiLevelsFor` enumerates API levels on disk, so r30's max-API-37 is picked up on its own. |
 
 Pinned compiler: **Zig 0.16.0**, tag
-`24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8`. Pinned NDK: **r29**
-(`29.0.14206865`), unpacked and read on this host at
-`/tmp/ndkx/android-ndk-r29`; release identity in `tools/ndk.sha256`. No claim
-here is made about any other revision of either.
+`24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8` — resolvable on **Codeberg**
+(`codeberg.org/ziglang/zig`), the only place the 0.16.0 tag exists; the GitHub
+repository is a moved-to-Codeberg mirror whose tags stop at 0.15.2. Pinned NDK:
+**r29** (`29.0.14206865`), as Google's manifest states it, unpacked and read on
+this host; release identity — release, revision, archive byte size, SHA-256 —
+is in `tools/ndk.sha256`, which is the durable record and the one to check. No
+claim here is made about any other revision of either.
 
-**Two entries record a fact that was wrong when first written and is now
-corrected**, and both were caught by reading the sysroot on disk rather than by
+**Three entries record a fact that was wrong when first written and is now
+corrected**, and each was caught by reading the sysroot on disk rather than by
 any check: p0004's `sys_include_dir`, which was
-`<sysroot>/usr/include/android` and is `<sysroot>/usr/include`, and p0008's
-host-tag set, which was five tags and is three. p0005's claim about where the
-API-agnostic archives live was wrong in the same way and is corrected there.
-Each says so in its own body, because a ledger entry that silently changes its
-answer is indistinguishable from one that never had one.
+`<sysroot>/usr/include/android` and is `<sysroot>/usr/include`; p0008's
+host-tag set, which was five tags and is three; and p0005's account of where
+the API-agnostic archives live, which was the API-level directory and is one
+level up. Each says so in its own body, because a ledger entry that silently
+changes its answer is indistinguishable from one that never had one.
+
+**p0009 records a defect that is fixed**, kept because the ledger's job is what
+a future change must revisit, and because the mistake is worth not repeating: a
+gate once reported success while emitting nothing.
 
 ## Ledger
 
@@ -194,13 +210,11 @@ Zig already knows the Android object names it looks for —
 are present in the r29 sysroot. That is why no manual object wiring exists in
 this package.
 
-**Enforcer: none for the object names, and stated here rather than left
-implied.** `tools/sync-ndk.sh` does not list them. A bump that moves the CRT
-objects is caught by `zig build ndk-link-check` **once that gate actually
-emits a binary**, and by nothing else today — it exits 0 while producing no
-ELF, so at the time of writing it would not catch this either. That gap is the
-reason the gate is the one this package cannot ship without, and the reason its
-current status is recorded as not established in `README.md` §Gates.
+**Enforcer: the link gate, and nothing else.** `tools/sync-ndk.sh` does not
+list the object names and cannot: they are not in `meta/abis.json`. A bump that
+moves the CRT objects is caught by `zig build ndk-link-check` and by nothing
+else, which is why that gate is the one this package cannot ship without. What
+that gate has to do before its exit code counts is p0009.
 
 **Counterchoice, recorded so the next reader does not re-derive it:** pointing
 `crt_dir` at the triple directory and letting each consumer append its own API
@@ -290,31 +304,88 @@ table's `aarch64-macos` row pins the Rosetta case to `darwin_x86_64`.
 enforces nothing. A plain `zig build` notices none of this. Re-read the manifest
 at an NDK bump.
 
+### p0009 — a compile nobody consumes emits nothing, and succeeds
+
+**This is the entry that would have caught a green gate proving nothing.**
+
+`ndk-link-check` once exited 0 while writing no binary. The mechanism is a
+compiler fact, not an NDK one, and the failure is the exact one this package
+exists to prevent: a step that reports success because nothing failed, not
+because anything was checked.
+
+A `Step.Compile` whose `generated_bin` is null has nothing to emit into, so the
+build runner passes `-fno-emit-bin` on the command line
+(`lib/std/Build/Step/Compile.zig:1406`). The compile links and the output goes
+nowhere. Only installing or running the artefact allocates `generated_bin`, so
+a gate that compiles and depends on the compile alone proves nothing at all.
+
+Two diagnoses were wrong on the way to the fix, and both are recorded here
+because each looks plausible and neither survives a check:
+
+- **"`libc.so` is not on the link line, so nothing was linked."** Wrong.
+  `Module.link_libc = true` already emits `-lc`
+  (`Step/Compile.zig:1355-1356`), and `linkAndroid` already sets it.
+- **"Add `linkSystemLibrary("c")`."** Wrong, and a no-op:
+  `Module.linkSystemLibrary` intercepts the name `c` and returns after setting
+  `m.link_libc = true` (`lib/std/Build/Module.zig:371-374`), so the call never
+  reaches the library list.
+
+The fix was on the build-script side, not the link side. `b.addInstallArtifact`
+allocates the field, and a generated `ndk-elf-check` program then opens the
+installed file and reads its ELF header: the magic, then `EI_CLASS`,
+`EI_DATA`, `EI_OSABI` and `e_machine`, each against the ABI the gate was asked
+to build. `\x7fELF` opens every ELF on every OS and architecture, so the magic
+alone cannot tell a bionic `arm64-v8a` binary from a host executable or from
+bionic for a different ABI; `e_machine` is what separates them, and `EI_CLASS`
+catches `-Dabi=armeabi-v7a` resolving to a 64-bit artefact. The expectations
+are passed as `--abi --class --machine` rather than compiled in, so the checker
+carries no ABI table of its own to drift from `build.zig`'s. That run step
+carries `has_side_effects = true`, so a cached second build does not skip the
+check. Negative cases were exercised: pointed at a text file it fails on the
+magic, and with the file absent it fails on `ArtefactUnreadable`.
+
+**Enforcer: the gate itself, plus this entry.** The general rule — never let a
+gate go green meaning "nothing failed" when it could equally mean "nothing was
+checked" — is `AGENTS.md` §3 trap 2, already stated for test steps. Reading the
+artefact back and checking it against the ABI that was requested enforces the
+concrete form for the link gate. Any future gate over a compile step owes the
+same, and a compiler bump is the event that would
+revisit the mechanism: at 0.17.0 re-read `Step/Compile.zig` around
+`generated_bin` before trusting that `-fno-emit-bin` is still appended on the
+same condition.
+
 ## Deferred, with reasons
 
 Known, and not done. Recording them is more useful than leaving them implied.
 
-- **No per-ABI link proof for any of the five ABIs, and not even one through
-  this package's own build.** The bionic link was exercised once, by a manual
-  `zig build-exe` against the r29 sysroot, for `aarch64-linux-android` at API 35.
-  `ndk-link-check` exists to cover the rest and **does not yet**: it resolves the
-  NDK, runs the paths-file helper, compiles the generated main, and emits no
-  ELF. `linkAndroid` sets `link_libc`, which selects the libc *installation*,
-  but nothing puts `libc.so` on the link line, and a dynamic link with no shared
-  library succeeds without producing a binary. The gap is
-  `compile.linkSystemLibrary("c")`. Until that is added and a run is observed to
-  emit an Android ELF, per-ABI coverage is the open question, not the mechanism,
-  and the gate's exit code must not be read as a pass.
-- **Nothing reads a build artefact back.** No gate asserts that a file exists
-  after a compile step, so a silent regression in `linkAndroid` would leave
-  `test`, `check` and `ndk-abi-check` green. That is why the missing
-  `linkSystemLibrary("c")` survived a green `ndk-link-check`.
+- **Per-ABI link proof for four of the five ABIs.** `ndk-link-check` was
+  observed linking `arm64-v8a` at API 35: `zig-out/bin/ndk-link-check` is
+  written and passes the ELF-header check, and `file(1)` reads it as an
+  aarch64 Android PIE with interpreter `/system/bin/linker64`, for Android 35,
+  built by NDK r29 (14206865). `ndk-abi-check` *compiles* the other four, which
+  is a different claim from having watched each one link. `-Dabi=<name>` and
+  `-Dapi=<n>` are what close that, with `-Dapi=35` required for `riscv64`
+  (p0006). Until each has been run, per-ABI coverage is the open question, not
+  the mechanism.
+- **No gate reads past the ELF header.** `ndk-elf-check` confirms the magic,
+  `EI_CLASS`, `EI_DATA`, `EI_OSABI` and `e_machine`, which is enough to refuse a
+  host artefact or one for the wrong ABI. It does not parse the program headers
+  or the dynamic section: that the artefact links `libc.so` and `libm.so` and
+  carries interpreter `/system/bin/linker64` is established by reading it with
+  `file(1)`, which no gate in this tree does.
+- **`EI_OSABI` does not separate bionic from glibc.** NDK r29 stamps
+  `ELFOSABI_NONE` (0) on `libc.so` for all five ABIs and every API level —
+  read from the unpacked tree — so the checker accepts 0 or 97 and refuses every
+  other value including glibc's GNU. Checking 97 alone would have refused the
+  correct binary, which is a gate permanently red and no better than one
+  permanently green.
 - **No `-static` or `libc++_shared` link is supported.** `crt_dir` is the
   API-level directory, and the API-agnostic archives live one level up (p0005),
   so nothing this package hands Zig can reach `libc.a`.
-- **No claim about r30.** r30 exists and is the current LTS; it was not read on
-  this host. r27 and r28 were not read either. `tools/sync-ndk.sh` is the thing
-  that turns "not read" into "read and diffed".
+- **No claim about r30.** r30 shipped 2026-09-08 and is the current LTS; it was
+  not read on this host, so nothing here describes it beyond its changelog. r27
+  and r28 were not read either. `tools/sync-ndk.sh` is the thing that turns "not
+  read" into "read and diffed".
 - **Two real on-disk root shapes exist.** Google's zip unpacks to
   `<ndk>/toolchains/llvm/prebuilt/<host-tag>/sysroot`, and nixpkgs' Android SDK
   puts the bundle under `libexec/android-sdk/ndk-bundle`. Both are handled;

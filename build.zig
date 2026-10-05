@@ -14,6 +14,16 @@
 //!   * `b.addTest` only compiles. `Step.Run` runs it, and only if it declares
 //!     `has_side_effects` or inherits stdio, otherwise it is skipped as cached
 //!     on the second build.
+//!   * A `Step.Run` fails its step on any non-zero exit when its stdio is
+//!     `.inherit`, whether it got there by inference or by assignment:
+//!     `runCommand` falls through to `handleChildProcessTerm`
+//!     (Step/Run.zig:1497-1510), which fails on every code but zero
+//!     (Step.zig:726-729). A `Step.Run` carrying no output argument also
+//!     already counts as having side effects (`hasSideEffects`,
+//!     Step/Run.zig:707-715), so the build runner never caches it away. Those
+//!     two facts are the whole mechanism behind `zig build sync-ndk`: they are
+//!     what make a shell script a gate rather than a command this build runs
+//!     and reports success on either way.
 //!   * `Step.Compile.linkage = .dynamic` is what emits `-dynamic`
 //!     (Step/Compile.zig:1487-1490) and `Module.link_libc = true` is what
 //!     emits `-lc` (Step/Compile.zig:1055, :1355-1357). Bionic needs both.
@@ -39,7 +49,7 @@
 
 const std = @import("std");
 
-/// One NDK ABI directory and the Zig target query that builds for it.
+/// One NDK ABI and the Zig target query that builds for it.
 ///
 /// These five entries are the gate's enumeration of the ABI set, transcribed
 /// from CONTRACT.md §2, which reads NDK r29's own `meta/abis.json`. They are
@@ -48,7 +58,10 @@ const std = @import("std");
 /// and fails the gate on any disagreement, so the two cannot drift apart
 /// silently.
 const AbiGate = struct {
-    /// NDK ABI directory name, as spelled under `sysroot/usr/lib`.
+    /// NDK ABI name: a `meta/abis.json` key, and the value `ANDROID_ABI` takes.
+    /// NOT a path component. `sysroot/usr/lib/` is namespaced by the sysroot
+    /// triple, so no `arm64-v8a` or `x86` directory exists anywhere under it;
+    /// `triple` below is what a path under `usr/lib` is spelled with.
     directory: []const u8,
     /// NDK sysroot triple, which is not a Zig triple.
     triple: []const u8,
@@ -58,6 +71,19 @@ const AbiGate = struct {
     cpu_arch: std.Target.Cpu.Arch,
     /// Lowest API level the NDK declares for that ABI.
     min_api_level: u32,
+    /// ELF `EI_CLASS` value an artefact for this ABI carries, from
+    /// `std.elf.CLASS`. `-Dabi=` can select `armeabi-v7a` and `x86`, which are
+    /// 32-bit, so the link gate's ELF check takes the class it demands from
+    /// here. Writing 64 into the check instead would be a second unearned
+    /// pass: `x86` would then be verified against a check written for the
+    /// other three, and the gate would be green on a 32-bit `e_machine` it
+    /// never looked at.
+    elf_class: std.elf.CLASS,
+    /// ELF `e_machine` value an artefact for this ABI carries, from
+    /// `std.elf.EM`. This is the load-bearing one: a host executable, or a
+    /// bionic binary for a different ABI, has the right magic and the right
+    /// OS/ABI and still fails here.
+    elf_machine: std.elf.EM,
 };
 
 const abi_gates = [_]AbiGate{
@@ -67,6 +93,8 @@ const abi_gates = [_]AbiGate{
         .zig_abi = .androideabi,
         .cpu_arch = .arm,
         .min_api_level = 21,
+        .elf_class = .@"32",
+        .elf_machine = .ARM,
     },
     .{
         .directory = "arm64-v8a",
@@ -74,6 +102,8 @@ const abi_gates = [_]AbiGate{
         .zig_abi = .android,
         .cpu_arch = .aarch64,
         .min_api_level = 21,
+        .elf_class = .@"64",
+        .elf_machine = .AARCH64,
     },
     .{
         .directory = "riscv64",
@@ -81,6 +111,8 @@ const abi_gates = [_]AbiGate{
         .zig_abi = .android,
         .cpu_arch = .riscv64,
         .min_api_level = 35,
+        .elf_class = .@"64",
+        .elf_machine = .RISCV,
     },
     .{
         .directory = "x86",
@@ -88,6 +120,8 @@ const abi_gates = [_]AbiGate{
         .zig_abi = .android,
         .cpu_arch = .x86,
         .min_api_level = 21,
+        .elf_class = .@"32",
+        .elf_machine = .@"386",
     },
     .{
         .directory = "x86_64",
@@ -95,10 +129,12 @@ const abi_gates = [_]AbiGate{
         .zig_abi = .android,
         .cpu_arch = .x86_64,
         .min_api_level = 21,
+        .elf_class = .@"64",
+        .elf_machine = .X86_64,
     },
 };
 
-/// The five NDK ABI directory names, for a consumer that iterates every ABI.
+/// The five NDK ABI names, for a consumer that iterates every ABI.
 pub const abi_directory_names = blk: {
     var names: [abi_gates.len][]const u8 = undefined;
     for (abi_gates, 0..) |gate, i| names[i] = gate.directory;
@@ -132,7 +168,7 @@ pub fn build(b: *std.Build) void {
     // ----------------------------------------------------------------------
     // Published module.
     //
-    // Registered with b.addModule so `b.dependency("zig-ndk", …).module("ndk")`
+    // Registered with b.addModule so `b.dependency("zig_ndk", …).module("ndk")`
     // resolves. No target and no optimize: CONTRACT.md §4 makes the consumer
     // responsible for both, and a value pinned here is a value the consumer
     // cannot override.
@@ -160,7 +196,7 @@ pub fn build(b: *std.Build) void {
     const abi_option = b.option(
         []const u8,
         "abi",
-        "NDK ABI directory name the ndk-link-check gate links for: armeabi-v7a, arm64-v8a, riscv64, x86 or x86_64. Defaults to arm64-v8a.",
+        "NDK ABI name (a meta/abis.json key, the value ANDROID_ABI takes) the ndk-link-check gate links for: armeabi-v7a, arm64-v8a, riscv64, x86 or x86_64. Not a sysroot directory: usr/lib is namespaced by triple. Defaults to arm64-v8a.",
     );
     const api_option = b.option(
         u32,
@@ -169,17 +205,27 @@ pub fn build(b: *std.Build) void {
     );
 
     // ----------------------------------------------------------------------
-    // Gate: host unit tests.
+    // Gate: unit tests.
     //
     // Rooted at root.zig so the package's published surface is what is
     // compiled and run, and so any `test` block the sources add is picked up
     // without a second file to keep in sync.
+    //
+    // The target is `target.result`, NOT `b.graph.host`, and that is the whole
+    // point of the branch below. Pinning the host here made
+    // `zig build test -Dtarget=wasm32-wasi` compile for x86_64-linux, print
+    // "compiles the tests for wasm32 and does not run them", and exit 0: a
+    // green gate that cross-compiled nothing, which is the same unearned pass
+    // as the `-fno-emit-bin` case above. A consumer wiring a foreign
+    // `-Dtarget` as a compile-only gate gets what it asked for or a failure.
+    // `standardTargetOptions` resolves to the host when `-Dtarget` is absent,
+    // so the default run is unchanged.
     // ----------------------------------------------------------------------
     const host_tests = b.addTest(.{
         .name = "ndk-tests",
         .root_module = b.createModule(.{
             .root_source_file = b.path("root.zig"),
-            .target = b.graph.host,
+            .target = target,
             .optimize = optimize,
         }),
     });
@@ -193,8 +239,9 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_host_tests.step);
     } else {
         // `-Dtarget=aarch64-linux-android` produces a binary this host cannot
-        // execute. Build it so the compile is still proven, and say plainly
-        // that it was not run rather than failing on a foreign executable.
+        // execute. Compile it — for that target, not for the host — and say
+        // plainly that it was not run rather than failing on a foreign
+        // executable.
         test_step.dependOn(&host_tests.step);
         std.log.warn(
             "-Dtarget is not native: `zig build test` compiles the tests for {s} " ++
@@ -210,7 +257,7 @@ pub fn build(b: *std.Build) void {
     if (fileExists(b, "test/integration_test.zig")) {
         const integration_module = b.createModule(.{
             .root_source_file = b.path("test/integration_test.zig"),
-            .target = b.graph.host,
+            .target = target,
             .optimize = optimize,
         });
         integration_module.addImport("ndk", ndk_module);
@@ -328,13 +375,33 @@ pub fn build(b: *std.Build) void {
             .api_level = api_level,
             .optimize = optimize,
             .check_abi_gates = true,
-        }) catch |err| {
-            const refuse = std.Build.Step.Fail.create(b, b.fmt(
-                \\`ndk-link-check` could not be configured: {t}
-                \\
-            , .{err}));
-            link_check_step.dependOn(&refuse.step);
-            break :link_check;
+        }) catch |err| switch (err) {
+            // Named in full rather than left to `{t}`: this one is a misuse of
+            // this package's API and not a configuration problem, and a bare
+            // error name reads as the latter. The gate below wires exactly one
+            // compilation exactly once, so this arm states the contract a
+            // consumer copies rather than a path it can reach today.
+            error.AlreadyLinked => {
+                const refuse = std.Build.Step.Fail.create(b,
+                    \\`ndk-link-check` wired one compilation twice, which
+                    \\linkAndroid refuses with error.AlreadyLinked:
+                    \\
+                    \\Compile.setLibCFile is last-call-wins, so a second call
+                    \\silently replaces the sysroot the compile is linked
+                    \\against. Wire one compilation once.
+                    \\
+                );
+                link_check_step.dependOn(&refuse.step);
+                break :link_check;
+            },
+            else => {
+                const refuse = std.Build.Step.Fail.create(b, b.fmt(
+                    \\`ndk-link-check` could not be configured: {t}
+                    \\
+                , .{err}));
+                link_check_step.dependOn(&refuse.step);
+                break :link_check;
+            },
         };
 
         // Installing is what makes the binary exist. Until something asks for
@@ -347,9 +414,14 @@ pub fn build(b: *std.Build) void {
         link_check_step.dependOn(&install_link.step);
 
         // The part of the gate that can fail. A green build step is not a
-        // proof, so the installed file is read back and refused unless it is an
-        // ELF. A link that emits nothing, or emits something that is not an
-        // executable, stops the gate instead of passing it.
+        // proof, so the installed file is read back and checked as the ELF it
+        // was asked to be. Magic bytes alone would not do: `\x7fELF` opens
+        // every ELF on every OS and every architecture, so a host executable,
+        // or a bionic binary for the wrong ABI, would pass it and turn a
+        // silent regression of the ABI wiring below into a green gate. The
+        // ELF class and machine come from the same `AbiGate` entry that chose
+        // the target query above, so nothing here is hardcoded in the checker
+        // and `-Dabi=` decides both.
         const elf_check = b.addExecutable(.{
             .name = "ndk-elf-check",
             .root_module = b.createModule(.{
@@ -359,6 +431,13 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const run_elf_check = b.addRunArtifact(elf_check);
+        run_elf_check.addArgs(&.{
+            "--abi",     gate.directory,
+            "--class",   b.fmt("{d}", .{@intFromEnum(gate.elf_class)}),
+            "--machine", b.fmt("{d}", .{@intFromEnum(gate.elf_machine)}),
+        });
+        // The path is the last argument, after the flags, the way the libc
+        // paths helper takes its output path.
         run_elf_check.addArg(b.getInstallPath(
             install_link.dest_dir orelse .bin,
             install_link.dest_sub_path,
@@ -369,6 +448,84 @@ pub fn build(b: *std.Build) void {
         run_elf_check.has_side_effects = true;
         run_elf_check.step.dependOn(&install_link.step);
         link_check_step.dependOn(&run_elf_check.step);
+    }
+
+    // ----------------------------------------------------------------------
+    // Gate: the pinned NDK facts.
+    //
+    // tools/sync-ndk.sh is the only thing in this repository that notices when
+    // the pin in tools/ndk.sha256 or the ABI table src/ndk.zig copied out of
+    // the NDK stops describing the NDK, and nothing else here can: the NDK
+    // does not announce that it moved, `ndk-abi-check` compiles the table this
+    // package holds — so a stale table still compiles — and `ndk-link-check`
+    // links against whatever sysroot is on disk, so a stale pin still links.
+    // Before this step the enforcer existed in the form and void in the force.
+    //
+    // `tools/` is in build.zig.zon's `.paths`, so a consumer who fetches this
+    // package HAS the script — but their build must not run it. This is this
+    // repository's gate on its own pinned facts: a dependent has no NDK, and
+    // has no business re-checking or rewriting somebody else's pin. So it is
+    // wired into `all` and nothing else, and in particular NOT into `check`,
+    // which is the CI gate and stays green with no NDK. Do not helpfully hang
+    // this off `check`.
+    //
+    // The NDK root is resolved here, by `resolveNdkRoot`, and handed over as
+    // `--ndk`. That is the same resolver, the same precedence and the same
+    // four-source refusal `ndk-link-check` uses, so one mental model covers
+    // both gates, and `-Dndk=` is honoured rather than silently ignored. The
+    // script carries its own copy of that discovery order and would use it
+    // when `--ndk` is absent (tools/sync-ndk.sh:269-300); naming the resolved
+    // root makes the two agree by construction rather than by agreement. The
+    // child inherits the runner's environment unchanged
+    // (Step/Run.zig:1241-1244), so NDK_ZIP and the three ANDROID_NDK_*
+    // variables reach the script on every route.
+    //
+    // The exit status is the gate. See the `Step.Run` bullet in the header
+    // comment for the mechanism: `.inherit` stdio turns a non-zero script exit
+    // into a failed step. `Step.Fail`, the other refusal this file uses, is a
+    // configure-time message and cannot see a script's exit status at all, so
+    // it is the wrong tool for the half of this gate that can fail.
+    //
+    // `--accept` is unreachable from this step, deliberately. It re-records
+    // tools/ndk.sha256, and a build flag that can rewrite a tracked file is a
+    // bad idea even for the person who means to use it: re-recording a pin is
+    // a human decision made after reading a diff, and no option in this file
+    // can be the thing that makes it. `argv` is handed over as an array and
+    // never through a shell, so no value of `-Dndk=` can become a flag
+    // either — a root called `--accept` is consumed as `--ndk`'s operand.
+    // ----------------------------------------------------------------------
+    const sync_ndk_step = b.step("sync-ndk", "Run tools/sync-ndk.sh: fail if the pinned NDK facts or the copied ABI table have moved");
+
+    sync_ndk: {
+        // The refusal is `ndkNotFoundMessage` reused whole, not a second
+        // rendering of the same four sources: two spellings of one discovery
+        // order is a second thing to update when it changes.
+        const ndk_root = resolveNdkRoot(b, ndk_option) orelse {
+            const refuse = std.Build.Step.Fail.create(b, ndkNotFoundMessage(b, ndk_option));
+            sync_ndk_step.dependOn(&refuse.step);
+            break :sync_ndk;
+        };
+
+        // `bash` by name rather than executing the script directly: the
+        // script's own dependency guard requires bash and dies naming it when
+        // it is absent (tools/sync-ndk.sh:86-90), and asking for that name is
+        // one step earlier than the runner's own exec failure.
+        //
+        // `b.pathFromRoot`, never a cwd-relative path. When zig-ndk is
+        // consumed as a dependency the cwd is the CONSUMER's root, and a
+        // relative `tools/sync-ndk.sh` would then be the consumer's file.
+        // `pathFromRoot` joins `b.build_root` (Build.zig:1769-1772), which is
+        // the directory holding THIS build.zig.
+        const run_sync = b.addSystemCommand(&.{ "bash", b.pathFromRoot("tools/sync-ndk.sh") });
+        run_sync.addArgs(&.{ "--ndk", ndk_root });
+        // Both halves are stated rather than inferred. `.inherit` is the mode
+        // std documents as failing on a non-zero exit, which is the property
+        // the whole gate rests on, and `has_side_effects` keeps a run with no
+        // output argument from being cached away on the second build. The same
+        // trap the test runner and the ELF check above set it for.
+        run_sync.stdio = .inherit;
+        run_sync.has_side_effects = true;
+        sync_ndk_step.dependOn(&run_sync.step);
     }
 
     // ----------------------------------------------------------------------
@@ -399,6 +556,7 @@ pub fn build(b: *std.Build) void {
     all_step.dependOn(check_step);
     all_step.dependOn(&fmt_check_step.step);
     all_step.dependOn(link_check_step);
+    all_step.dependOn(sync_ndk_step);
 }
 
 /// One NDK ABI, as a Zig target query, for `ndk-abi-check` and the link gate.
@@ -419,21 +577,52 @@ fn joinGateNames(b: *std.Build) []const u8 {
     return joined.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
 
-/// Resolve an NDK root using CONTRACT.md D3's order, first hit wins.
+/// The first candidate in CONTRACT.md D3's order that is on disk.
 ///
-/// Returns the candidate as the caller supplied it. Nothing is checked for
-/// existence here: the layout knowledge belongs to the `ndk` module, and the
-/// whole point of the `-Dndk` option is that a caller may point at either the
-/// direct NDK layout or the nixpkgs `ndk-bundle` layout.
+/// The walk is `Ndk.find`'s, and it is duplicated here for one reason: D3's
+/// refusal message has to name every source and what each one read, and only
+/// this file can render the build runner's environment. `Ndk.find` renders
+/// nothing, so it cannot discharge that half.
+///
+/// The duplication copies the rule and not the knowledge, and that is what
+/// makes it safe. `Ndk.find` (src/ndk.zig:512-523) returns `error.FileNotFound`
+/// out of `resolve` for exactly one reason — the candidate path itself is not
+/// there (src/ndk.zig:898-901); every other failure is a decision the caller
+/// has to see and stops the walk. "Is this path on disk" is therefore the
+/// whole of the selection, and a candidate that exists but is not an NDK
+/// stops here exactly as it stops there. Nothing below probes a sysroot, so
+/// this file still knows no NDK layout.
+///
+/// Without the existence test the two answers diverge. With
+/// `ANDROID_NDK_HOME=/gone` and `ANDROID_NDK_ROOT=<an unpacked r29>`,
+/// `Ndk.find` walks past `/gone` and a library consumer links against r29,
+/// while this function handed `/gone` to the generated helper, which refused
+/// with `NotAnNdk`: same shell, same package, two answers, and the gate the
+/// package is named after was the one that was wrong.
 fn resolveNdkRoot(b: *std.Build, explicit: ?[]const u8) ?[]const u8 {
     if (explicit) |path| {
-        if (path.len != 0) return path;
+        if (path.len != 0 and isOnDisk(b, path)) return path;
     }
     for (ndk_env_vars) |name| {
         const value = b.graph.environ_map.get(name) orelse continue;
-        if (value.len != 0) return value;
+        if (value.len == 0) continue;
+        if (isOnDisk(b, value)) return value;
     }
     return null;
+}
+
+/// Whether `path` names something that is there.
+///
+/// `statFile` and not `access`, and only `FileNotFound` counts as absent: a
+/// path that exists and cannot be read is still the candidate `Ndk.find` stops
+/// on and hands to `Ndk.open` to refuse by name. Treating that as absent
+/// would turn a diagnosable refusal here into a silent fall-through to the
+/// next source.
+fn isOnDisk(b: *std.Build, path: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(b.graph.io, path, .{}) catch |err| {
+        return err != error.FileNotFound;
+    };
+    return true;
 }
 
 fn envOrUnset(b: *std.Build, name: []const u8) []const u8 {
@@ -447,20 +636,28 @@ fn ndkNotFoundMessage(b: *std.Build, explicit: ?[]const u8) []const u8 {
         \\no Android NDK was found, so the libc link gate cannot run.
         \\
         \\`ndk-link-check` looks for an NDK in this order and stops at the first
-        \\source that is set. Each of them read:
+        \\source that is set AND on disk. A source naming a path that is not
+        \\there is walked past, the rule `Ndk.find` uses, so a stale
+        \\ANDROID_NDK_HOME hands the turn to the next source instead of failing
+        \\the gate. Each of them read:
         \\
         \\  1. the -Dndk build option           {s}
         \\  2. the ANDROID_NDK_HOME environment {s}
         \\  3. the ANDROID_NDK_ROOT environment {s}
         \\  4. the ANDROID_NDK environment      {s}
         \\
-        \\Point one of them at an unpacked NDK, the directory holding
-        \\`source.properties` and `toolchains/`:
+        \\If every one of those is unset or names nothing on disk, point one of
+        \\them at an unpacked NDK, the directory holding `source.properties`
+        \\and `toolchains/`:
         \\
         \\  zig build ndk-link-check -Dndk=/path/to/android-ndk-r29
         \\
-        \\`zig build test`, `zig build ndk-abi-check` and `zig build check` do
-        \\not need an NDK and stay green without one.
+        \\One cause is not a path at all. Google publishes NDK host tags for
+        \\linux-x86_64, darwin-x86_64 and windows-x86_64 and for no others, so
+        \\on any other build host no value above can satisfy this gate, and the
+        \\refusal a set source gets instead is `UnsupportedHost`, named "this
+        \\build host has no NDK toolchain". Run the gate on a host Google ships
+        \\a package for, or cross the toolchain yourself.
         \\
     , .{
         explicitOrUnset(explicit),
@@ -483,13 +680,25 @@ fn explicitOrUnset(explicit: ?[]const u8) []const u8 {
     return "(unset)";
 }
 
-/// Whether a path relative to the package root exists right now.
+/// Whether a path relative to THIS package's root exists right now.
 ///
 /// Used only to decide whether the integration test is wired in. Every NDK
 /// path check goes through the `ndk` module instead, so that this file keeps
 /// no NDK layout knowledge at all.
+///
+/// Resolved against `b.pathFromRoot`, never against the process working
+/// directory. When zig-ndk is consumed as a dependency the cwd is the
+/// CONSUMER's root, so a cwd-relative probe asks the wrong tree twice over:
+/// zig-ndk's own `test/integration_test.zig` is not found and the gate quietly
+/// degrades to running less than it claims to, and a consumer who happens to
+/// have a file at that same relative path gets THEIR file compiled as
+/// zig-ndk's integration test. `b.pathFromRoot` (lib/std/Build.zig:1770) joins
+/// `b.build_root`, which is the root of whichever package this build script
+/// belongs to. `b.path` is the other primitive and is not interchangeable: it
+/// hands out a `LazyPath` this script owns and compiles, which is what the
+/// compilations above want, and probing wants a plain path.
 fn fileExists(b: *std.Build, sub_path: []const u8) bool {
-    std.Io.Dir.cwd().access(b.graph.io, sub_path, .{}) catch return false;
+    std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(sub_path), .{}) catch return false;
     return true;
 }
 
@@ -498,10 +707,21 @@ pub const AndroidLinkOptions = struct {
     /// NDK root to use. `null` runs the CONTRACT.md D3 discovery order. The
     /// value is borrowed for the build run; nothing here owns memory.
     ndk: ?[]const u8 = null,
-    /// NDK ABI directory name: `armeabi-v7a`, `arm64-v8a`, `riscv64`, `x86`
-    /// or `x86_64`. Anything else is refused rather than guessed at.
+    /// NDK ABI name: a `meta/abis.json` key, `ANDROID_ABI`'s value, and not a
+    /// path component — `sysroot/usr/lib/` holds triples. `armeabi-v7a`,
+    /// `arm64-v8a`, `riscv64`, `x86` or `x86_64`; anything else is refused
+    /// rather than guessed at.
     abi: []const u8 = default_link_abi,
     /// Android API level. The sysroot must ship `usr/lib/<triple>/<api>`.
+    ///
+    /// Measured floor, not a guess: bionic gained `preadv64`/`pwritev64` at
+    /// API 24, and Zig's default panic handler reaches `std.Io.Threaded`,
+    /// which calls both. So `-Dapi=21` links at `-Doptimize=ReleaseSmall` or
+    /// `ReleaseFast` and fails in `Debug` or `ReleaseSafe` with exactly
+    /// `undefined symbol: preadv64`. Confirmed on r29: `arm64-v8a` is green at
+    /// API 24 and red at 21, and `ReleaseSmall` is green at 21. That is a
+    /// property of bionic and of Zig's panic handler, not of the NDK wiring,
+    /// which resolves at every level.
     api_level: u32 = default_link_api_level,
     /// Optimization mode for the generated paths-file helper, which always
     /// runs on the build host.
@@ -540,9 +760,19 @@ pub const ResolvedNdk = struct {
 /// sysroot is fully expressed by the libc paths file, whose CRT directory the
 /// ELF linker turns into `-L` on its own (src/link/Elf.zig:1042-1046).
 ///
-/// Call this once per `compile`. Building a second paths-file helper for the
-/// same compilation produces duplicate module instances, which Zig 0.16
-/// reports as "file exists in modules 'x' and 'x0'".
+/// Refuses on the second call for the same `compile`, with
+/// `error.AlreadyLinked`, before it looks at an NDK at all: a caller who
+/// wired one compilation twice must be told that, and not handed
+/// `NdkNotFound` for a misconfigured NDK instead. The reason is not tidiness.
+/// `setLibCFile` assigns `compile.libc_file` unconditionally
+/// (Step/Compile.zig:829), so a second call is not an error this compiler
+/// reports: it is last-call-wins, and the `ResolvedNdk` this function returns
+/// the second time then names one sysroot while the compile line carries the
+/// other's `--libc` file. The mismatch surfaces much later, as an undefined
+/// symbol out of the linker (`statx`, `copy_file_range`) when the CRT
+/// directory's API level and the target's disagree, with nothing in the
+/// failure pointing back here. A silent replacement is worse than a wrong
+/// one. One compilation, one paths file, one API level.
 ///
 /// Wiring a compilation is not the same as producing one. The artefact is
 /// emitted only once something asks for it — `b.addInstallArtifact`,
@@ -559,6 +789,8 @@ pub fn linkAndroid(
     compile: *std.Build.Step.Compile,
     options: AndroidLinkOptions,
 ) !ResolvedNdk {
+    if (compile.libc_file != null) return error.AlreadyLinked;
+
     const root = resolveNdkRoot(b, options.ndk) orelse return error.NdkNotFound;
     if (gateFor(options.abi) == null) return error.UnsupportedAbi;
 
@@ -585,12 +817,21 @@ pub fn linkAndroid(
     });
     if (options.check_abi_gates) {
         for (abi_gates) |gate| {
+            // Every field of the entry, not a subset: `cpu_arch` decides what
+            // gets built and `elf_class`/`elf_machine` decide what the link
+            // gate then accepts, so a typo in any of the three has to fail
+            // here rather than in the one gate that needs an NDK. The helper
+            // re-derives all of them from the module and checks the row count
+            // as well, so a deleted row fails as loudly as a mistyped one.
             run_helper.addArgs(&.{
                 "--gate",
                 gate.directory,
                 gate.triple,
                 @tagName(gate.zig_abi),
                 b.fmt("{d}", .{gate.min_api_level}),
+                @tagName(gate.cpu_arch),
+                b.fmt("{d}", .{@intFromEnum(gate.elf_class)}),
+                b.fmt("{d}", .{@intFromEnum(gate.elf_machine)}),
             });
         }
     }
@@ -623,45 +864,277 @@ const link_check_main_source =
     \\}
 ;
 
-/// The program that refuses a link gate which produced no binary.
+/// The program that refuses a link gate which produced the wrong binary, or
+/// no binary at all.
 ///
 /// `ndk-link-check` ends in a `Step.Compile`, and a compile that emits nothing
 /// is a successful one. This program is the part of the gate that can fail, so
 /// it reads the artefact back instead of trusting the step summary.
 ///
+/// `\x7fELF` opens every ELF file on every operating system and every
+/// architecture, so a magic check on its own cannot tell a bionic binary for
+/// `arm64-v8a` from a host x86-64 executable or from bionic for a different
+/// ABI. Both of those are silent regressions of the ABI wiring above, and a
+/// gate that cannot see them is not the gate this package needs. So the
+/// header is read far enough to check `EI_CLASS`, `EI_DATA`, `EI_OSABI` and
+/// `e_machine` as well, each against the ABI the gate was asked to build.
+///
 /// Invoked as
 ///
-///     ndk-elf-check <installed path of the linked executable>
+///     ndk-elf-check --abi <dir> --class <EI_CLASS> --machine <e_machine> <path>
 ///
-/// A file that is not there fails in `openFile`; a file that is there and is
-/// not an ELF fails on its first four bytes. Either way the gate stops.
+/// The three expectation arguments are arguments rather than constants for one
+/// reason: `-Dabi=` selects the ABI, and two of the five are 32-bit. The
+/// caller fills them from the same `AbiGate` entry that chose the target
+/// query, so this program carries no ABI table of its own to drift.
 const elf_check_source =
     \\// Generated by zig-ndk's build.zig. Do not edit.
     \\const std = @import("std");
     \\
-    \\pub fn main(init: std.process.Init) !void {
+    \\const magic = "\x7fELF";
+    \\
+    \\/// `ELFOSABI_NONE`, spelled out so the diagnostics can name it.
+    \\const osabi_none: u8 = @intFromEnum(std.elf.OSABI.NONE);
+    \\/// `ELFOSABI_ANDROID`, which is 97 (`0x61`). `std.elf.OSABI` has no
+    \\/// `ANDROID` member: it spells this same value `ARM` (elf.zig:1700), the
+    \\/// ARM EABI slot that Android reuses. Named here under the name the
+    \\/// diagnostic has to use.
+    \\const osabi_android: u8 = 97;
+    \\
+    \\const e_ident_len = std.elf.EI.NIDENT;
+    \\const e_machine_offset = @offsetOf(std.elf.Elf64.Ehdr, "machine");
+    \\/// `e_ident` plus `e_type` plus `e_machine`, and nothing more: this gate
+    \\/// reads the header's identity, not the program headers after it.
+    \\const e_header_len = e_machine_offset + @sizeOf(std.elf.Half);
+    \\
+    \\comptime {
+    \\    // Every index and offset below is taken from `std.elf` rather than
+    \\    // written out here, and these are what make that safe: a compiler
+    \\    // that moves a field fails to compile this check instead of quietly
+    \\    // reading the wrong byte and passing a wrong artefact.
+    \\    if (@offsetOf(std.elf.Elf64.Ehdr, "ident") != 0 or
+    \\        @offsetOf(std.elf.Elf32.Ehdr, "ident") != 0)
+    \\        @compileError("e_ident is no longer the first member of the ELF header");
+    \\    // 16 bytes of e_ident and a 16-bit e_type put `e_machine` at 18 in
+    \\    // both the 32-bit and the 64-bit header, so one offset serves both
+    \\    // classes and the class check does not have to come first.
+    \\    if (e_machine_offset != 18 or @offsetOf(std.elf.Elf32.Ehdr, "machine") != 18)
+    \\        @compileError("e_machine is no longer at offset 18 of the ELF header");
+    \\    if (std.elf.EI.CLASS >= e_ident_len or std.elf.EI.DATA >= e_ident_len or
+    \\        std.elf.EI.OSABI >= e_ident_len)
+    \\        @compileError("an EI_* index now falls outside e_ident");
+    \\}
+    \\
+    \\/// Every refusal this program can make and nothing else, so a reader of
+    \\/// the exit status can tell which check fired. Nothing std can fail with
+    \\/// leaks in: an IO failure and a failed argument list are both logged
+    \\/// with their own message and folded into the one member that means
+    \\/// "this run proved nothing".
+    \\const CheckError = error{
+    \\    MissingArtefactPath,
+    \\    MissingExpectation,
+    \\    BadInvocation,
+    \\    BadExpectation,
+    \\    ArtefactUnreadable,
+    \\    NotAnElfFile,
+    \\    TruncatedElfHeader,
+    \\    WrongElfClass,
+    \\    WrongElfData,
+    \\    WrongElfOsAbi,
+    \\    WrongElfMachine,
+    \\};
+    \\
+    \\pub fn main(init: std.process.Init) CheckError!void {
     \\    const gpa = init.arena.allocator();
     \\    const io = init.io;
     \\
-    \\    const args = try init.minimal.args.toSlice(gpa);
+    \\    const args = init.minimal.args.toSlice(gpa) catch |err| {
+    \\        std.log.err("this program's own arguments could not be read: {t}", .{err});
+    \\        return error.BadInvocation;
+    \\    };
     \\    if (args.len < 2) return error.MissingArtefactPath;
-    \\    const path = args[1];
+    \\    // The path is last, after the flags: the flags are a fixed set and a
+    \\    // path is not, which is the same shape the libc paths helper is
+    \\    // invoked in.
+    \\    const path = args[args.len - 1];
+    \\    const flags = args[1 .. args.len - 1];
     \\
-    \\    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    \\    var abi: []const u8 = "";
+    \\    var want_class: ?std.elf.CLASS = null;
+    \\    var want_machine: ?std.elf.EM = null;
+    \\
+    \\    var i: usize = 0;
+    \\    while (i < flags.len) {
+    \\        const flag = flags[i];
+    \\        if (i + 1 >= flags.len) return error.BadInvocation;
+    \\        const value = flags[i + 1];
+    \\        if (std.mem.eql(u8, flag, "--abi")) {
+    \\            abi = value;
+    \\        } else if (std.mem.eql(u8, flag, "--class")) {
+    \\            const raw = std.fmt.parseInt(u8, value, 10) catch return error.BadExpectation;
+    \\            want_class = std.enums.fromInt(std.elf.CLASS, raw) orelse return error.BadExpectation;
+    \\        } else if (std.mem.eql(u8, flag, "--machine")) {
+    \\            const raw = std.fmt.parseInt(u16, value, 10) catch return error.BadExpectation;
+    \\            want_machine = std.enums.fromInt(std.elf.EM, raw) orelse return error.BadExpectation;
+    \\        } else {
+    \\            std.log.err("unrecognised argument '{s}'", .{flag});
+    \\            return error.BadInvocation;
+    \\        }
+    \\        i += 2;
+    \\    }
+    \\
+    \\    const expected_class = want_class orelse return error.MissingExpectation;
+    \\    const expected_machine = want_machine orelse return error.MissingExpectation;
+    \\    if (abi.len == 0) return error.MissingExpectation;
+    \\
+    \\    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+    \\        std.log.err("the link gate installed '{s}', which cannot be read: {t}", .{ path, err });
+    \\        return error.ArtefactUnreadable;
+    \\    };
     \\    defer file.close(io);
     \\
-    \\    var magic: [4]u8 = undefined;
-    \\    const chunks = [_][]u8{&magic};
-    \\    const read = try file.readStreaming(io, &chunks);
-    \\    if (read != magic.len or !std.mem.eql(u8, &magic, "\x7fELF")) {
+    \\    var header: [e_header_len]u8 = undefined;
+    \\    const chunks = [_][]u8{&header};
+    \\    const read = file.readStreaming(io, &chunks) catch |err| {
+    \\        std.log.err("the link gate installed '{s}', which cannot be read: {t}", .{ path, err });
+    \\        return error.ArtefactUnreadable;
+    \\    };
+    \\
+    \\    // The magic check is the one this gate has always made and it stays
+    \\    // first, unchanged: a file that is not an ELF at all has nothing else
+    \\    // to say, and nothing after it can be trusted to be a header.
+    \\    if (read < magic.len or !std.mem.eql(u8, header[0..magic.len], magic)) {
     \\        std.log.err(
     \\            "the link gate produced '{s}', which does not begin with " ++
     \\                "the ELF magic: read {d} of 4 bytes, no Android " ++
     \\                "executable was emitted",
-    \\            .{ path, read },
+    \\            .{ path, @min(read, magic.len) },
     \\        );
     \\        return error.NotAnElfFile;
     \\    }
+    \\    if (read < e_header_len) {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose ELF header ends early: read {d} of " ++
+    \\                "the {d} bytes that e_ident, e_type and e_machine need, so no ABI " ++
+    \\                "can be read out of it",
+    \\            .{ path, read, e_header_len },
+    \\        );
+    \\        return error.TruncatedElfHeader;
+    \\    }
+    \\
+    \\    const found_class = std.enums.fromInt(std.elf.CLASS, header[std.elf.EI.CLASS]) orelse {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose EI_CLASS is {d}, which is not an ELF class at all",
+    \\            .{ path, header[std.elf.EI.CLASS] },
+    \\        );
+    \\        return error.WrongElfClass;
+    \\    };
+    \\    if (found_class != expected_class) {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', which is an ELF{s} file, but -Dabi={s} " ++
+    \\                "builds an ELF{s} file: EI_CLASS is {d}, expected {d}",
+    \\            .{
+    \\                path,
+    \\                tagName(std.elf.CLASS, found_class),
+    \\                abi,
+    \\                tagName(std.elf.CLASS, expected_class),
+    \\                @intFromEnum(found_class),
+    \\                @intFromEnum(expected_class),
+    \\            },
+    \\        );
+    \\        return error.WrongElfClass;
+    \\    }
+    \\
+    \\    const found_data = std.enums.fromInt(std.elf.DATA, header[std.elf.EI.DATA]) orelse {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose EI_DATA is {d}, which is not an ELF encoding at all",
+    \\            .{ path, header[std.elf.EI.DATA] },
+    \\        );
+    \\        return error.WrongElfData;
+    \\    };
+    \\    if (found_data != std.elf.DATA.@"2LSB") {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', which is a {s} ELF, but every Android bionic " ++
+    \\                "binary is ELFDATA2LSB: EI_DATA is {d}, expected {d}",
+    \\            .{
+    \\                path,
+    \\                tagName(std.elf.DATA, found_data),
+    \\                @intFromEnum(found_data),
+    \\                @intFromEnum(std.elf.DATA.@"2LSB"),
+    \\            },
+    \\        );
+    \\        return error.WrongElfData;
+    \\    }
+    \\
+    \\    // EI_DATA was just checked as 2LSB, so the two bytes at `e_machine`
+    \\    // below are known to be little-endian.
+    \\    //
+    \\    // On the OS/ABI byte: an Android value is what says the artefact was
+    \\    // linked against bionic rather than against another libc. Read off
+    \\    // this toolchain's own output, NDK r29's bionic stamps
+    \\    // ELFOSABI_NONE, not ELFOSABI_ANDROID — every usr/lib/<triple>/<api>/
+    \\    // libc.so for all five ABIs and every API level reads 0 at byte 7, and
+    \\    // so does the artefact `zig build ndk-link-check` installs. So 97 alone
+    \\    // would refuse the correct binary and leave the gate permanently red,
+    \\    // which is the same defect as a gate that never fails: a green run
+    \\    // nobody can trust. Both Android values are therefore accepted, and
+    \\    // everything else — GNU, which is the glibc value, and the rest — is
+    \\    // refused by name. This byte does not separate bionic from glibc on
+    \\    // its own; `e_machine` below is what separates a host artefact from
+    \\    // an Android one.
+    \\    const found_osabi = header[std.elf.EI.OSABI];
+    \\    if (found_osabi != osabi_none and found_osabi != osabi_android) {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose ELF OS/ABI is {s} ({d}): an NDK bionic " ++
+    \\                "link stamps {s} ({d}) or {s} ({d}), and no other value names an Android " ++
+    \\                "sysroot, so this artefact was not linked against bionic",
+    \\            .{
+    \\                path,
+    \\                osabiName(found_osabi),
+    \\                found_osabi,
+    \\                osabiName(osabi_none),
+    \\                osabi_none,
+    \\                osabiName(osabi_android),
+    \\                osabi_android,
+    \\            },
+    \\        );
+    \\        return error.WrongElfOsAbi;
+    \\    }
+    \\
+    \\    const machine_bytes: *const [@sizeOf(std.elf.Half)]u8 = header[e_machine_offset..][0..@sizeOf(std.elf.Half)];
+    \\    const found_machine = std.mem.readInt(std.elf.Half, machine_bytes, .little);
+    \\    if (found_machine != @intFromEnum(expected_machine)) {
+    \\        std.log.err(
+    \\            "the link gate produced '{s}', whose e_machine is {s} ({d}), but -Dabi={s} " ++
+    \\                "builds {s} ({d}): the artefact is for another architecture than the " ++
+    \\                "ABI this gate was asked to link",
+    \\            .{
+    \\                path,
+    \\                machineName(found_machine),
+    \\                found_machine,
+    \\                abi,
+    \\                @tagName(expected_machine),
+    \\                @intFromEnum(expected_machine),
+    \\            },
+    \\        );
+    \\        return error.WrongElfMachine;
+    \\    }
+    \\}
+    \\
+    \\fn tagName(comptime E: type, value: E) []const u8 {
+    \\    return std.enums.tagName(E, value) orelse "unnamed";
+    \\}
+    \\
+    \\fn machineName(value: std.elf.Half) []const u8 {
+    \\    const tag = std.enums.fromInt(std.elf.EM, value) orelse return "an architecture Zig has no EM name for";
+    \\    return tagName(std.elf.EM, tag);
+    \\}
+    \\
+    \\fn osabiName(value: u8) []const u8 {
+    \\    if (value == osabi_android) return "ELFOSABI_ANDROID";
+    \\    if (value == osabi_none) return "ELFOSABI_NONE";
+    \\    const tag = std.enums.fromInt(std.elf.OSABI, value) orelse return "an OS/ABI Zig has no name for";
+    \\    return tagName(std.elf.OSABI, tag);
     \\}
 ;
 
@@ -674,8 +1147,9 @@ const elf_check_source =
 ///
 /// Invoked as
 ///
-///     ndk-libc-file --ndk <root> --abi <dir> --api <level>
-///                  [--gate <dir> <triple> <zig-abi> <min-api>]... <out-path>
+///     ndk-libc-file --ndk <root> --abi <name> --api <level>
+///                  [--gate <name> <triple> <zig-abi> <min-api>
+///                          <cpu-arch> <elf-class> <elf-machine>]... <out-path>
 ///
 /// The last argument is the file to write. Its layout, its mandatory fields
 /// and the comment block above them live in `src/libc_file.zig`, which is the
@@ -698,21 +1172,24 @@ const libc_file_helper_source =
     \\    var ndk_root: ?[]const u8 = null;
     \\    var abi_directory: ?[]const u8 = null;
     \\    var api_level: u32 = 0;
-    \\    var gates: std.ArrayList([4][]const u8) = .empty;
+    \\    var gates: std.ArrayList([7][]const u8) = .empty;
     \\    defer gates.deinit(gpa);
     \\
     \\    var i: usize = 0;
     \\    while (i < body.len) {
     \\        const flag = body[i];
     \\        if (std.mem.eql(u8, flag, "--gate")) {
-    \\            if (i + 4 >= body.len) return error.TruncatedGate;
+    \\            if (i + 7 >= body.len) return error.TruncatedGate;
     \\            try gates.append(gpa, .{
     \\                body[i + 1],
     \\                body[i + 2],
     \\                body[i + 3],
     \\                body[i + 4],
+    \\                body[i + 5],
+    \\                body[i + 6],
+    \\                body[i + 7],
     \\            });
-    \\            i += 5;
+    \\            i += 8;
     \\            continue;
     \\        }
     \\        if (i + 1 >= body.len) return error.MissingValue;
@@ -733,21 +1210,34 @@ const libc_file_helper_source =
     \\    const root = ndk_root orelse return error.MissingNdkRoot;
     \\    const wanted = abi_directory orelse return error.MissingAbi;
     \\    const abi = abiByDirectoryName(wanted) orelse {
-    \\        std.log.err("the zig-ndk module has no ABI whose directory is '{s}'", .{wanted});
+    \\        std.log.err("the zig-ndk module has no ABI named '{s}'", .{wanted});
     \\        return error.UnsupportedAbi;
     \\    };
     \\
-    \\    try checkGateTable(gates.items, wanted);
+    \\    try checkGateTable(gates.items);
     \\
     \\    const host = ndk.Ndk.hostTag(builtin.target) catch |err| {
     \\        std.log.err("this build host has no NDK toolchain: {t}", .{err});
     \\        return err;
     \\    };
     \\    const install = ndk.Ndk.open(gpa, io, root, host) catch |err| {
-    \\        std.log.err(
-    \\            "'{s}' does not resolve to an unpacked Android NDK: {t}",
-    \\            .{ root, err },
-    \\        );
+    \\        // `NotAnNdk` is the union of the three mistakes a caller really
+    \\        // makes — a zip, an Android SDK root, an NDK unpacked for another
+    \\        // host tag — so the error name alone leaves the reader guessing
+    \\        // which one they made. The library exports the half that names
+    \\        // the probed paths, so use it rather than re-spelling the two
+    \\        // layouts here, where a second copy could disagree with the one
+    \\        // that did the probing.
+    \\        if (err == error.NotAnNdk) {
+    \\            var report: std.Io.Writer.Allocating = .init(gpa);
+    \\            ndk.Ndk.describeProbeFailure(gpa, io, root, host, &report.writer) catch {};
+    \\            std.log.err(
+    \\                "'{s}' does not resolve to an unpacked Android NDK: {t}\n{s}",
+    \\                .{ root, err, report.written() },
+    \\            );
+    \\        } else {
+    \\            std.log.err("'{s}' does not resolve to an unpacked Android NDK: {t}", .{ root, err });
+    \\        }
     \\        return err;
     \\    };
     \\    const crt_path = ndk.Ndk.libcDirFor(install, gpa, io, abi, api_level) catch |err| {
@@ -800,13 +1290,32 @@ const libc_file_helper_source =
     \\/// Re-derive the build script's ABI table from the module and refuse any
     \\/// disagreement, so the two copies of the layout cannot drift apart
     \\/// without failing the gate.
-    \\fn checkGateTable(gates: []const [4][]const u8, wanted: []const u8) !void {
+    \\///
+    \\/// Every field of an entry is compared, and so is the row count. Those are
+    \\/// the two holes a subset leaves: `cpu_arch` decides what the gate builds
+    \\/// and `elf_class`/`elf_machine` decide what the gate then accepts, and a
+    \\/// typo in any of the three still compiles — root.zig has no
+    \\/// arch-specific code, so `ndk-abi-check` cannot see it — while a
+    \\/// deleted row is invisible to a loop over the rows that were handed over.
+    \\///
+    \\/// The ELF class and machine are not spelled as numbers below. They are
+    \\/// derived from the sysroot triple the MODULE publishes, so this is the
+    \\/// module's own data answering, and the numbers themselves are `std.elf`'s.
+    \\fn checkGateTable(gates: []const [7][]const u8) !void {
+    \\    const expected_rows = std.enums.values(ndk.Abi).len;
+    \\    if (gates.len != expected_rows) {
+    \\        std.log.err(
+    \\            "the build script's ABI table has {d} rows and the zig-ndk module has {d} ABIs",
+    \\            .{ gates.len, expected_rows },
+    \\        );
+    \\        return error.GateTableMismatch;
+    \\    }
     \\    for (gates) |gate| {
-    \\        const directory = gate[0];
-    \\        const abi = abiByDirectoryName(directory) orelse {
+    \\        const name = gate[0];
+    \\        const abi = abiByDirectoryName(name) orelse {
     \\            std.log.err(
     \\                "the build script's ABI table lists '{s}', which the zig-ndk module does not have",
-    \\                .{directory},
+    \\                .{name},
     \\            );
     \\            return error.GateTableMismatch;
     \\        };
@@ -814,31 +1323,89 @@ const libc_file_helper_source =
     \\        if (!std.mem.eql(u8, abi.triple(), gate[1])) {
     \\            std.log.err(
     \\                "'{s}': build script triple '{s}', module triple '{s}'",
-    \\                .{ directory, gate[1], abi.triple() },
+    \\                .{ name, gate[1], abi.triple() },
     \\            );
     \\            return error.GateTableMismatch;
     \\        }
     \\        if (!std.mem.eql(u8, @tagName(abi.zigAbi()), gate[2])) {
     \\            std.log.err(
     \\                "'{s}': build script Zig ABI '{s}', module Zig ABI '{s}'",
-    \\                .{ directory, gate[2], @tagName(abi.zigAbi()) },
+    \\                .{ name, gate[2], @tagName(abi.zigAbi()) },
     \\            );
     \\            return error.GateTableMismatch;
     \\        }
     \\        if (abi.minApiLevel() != min_api_level) {
     \\            std.log.err(
     \\                "'{s}': build script minimum API level {d}, module minimum {d}",
-    \\                .{ directory, min_api_level, abi.minApiLevel() },
+    \\                .{ name, min_api_level, abi.minApiLevel() },
+    \\            );
+    \\            return error.GateTableMismatch;
+    \\        }
+    \\        const elf_class = std.fmt.parseInt(u8, gate[5], 10) catch return error.BadGate;
+    \\        const elf_machine = std.fmt.parseInt(u16, gate[6], 10) catch return error.BadGate;
+    \\        const identity = identityForTriple(abi.triple()) orelse {
+    \\            std.log.err(
+    \\                "'{s}': module triple '{s}' names no architecture this build knows",
+    \\                .{ name, abi.triple() },
+    \\            );
+    \\            return error.GateTableMismatch;
+    \\        };
+    \\        if (!std.mem.eql(u8, identity.cpu_arch, gate[4])) {
+    \\            std.log.err(
+    \\                "'{s}': build script CPU arch '{s}', module triple '{s}' means '{s}'",
+    \\                .{ name, gate[4], abi.triple(), identity.cpu_arch },
+    \\            );
+    \\            return error.GateTableMismatch;
+    \\        }
+    \\        if (identity.class != elf_class) {
+    \\            std.log.err(
+    \\                "'{s}': build script EI_CLASS {d}, module triple '{s}' means EI_CLASS {d}",
+    \\                .{ name, elf_class, abi.triple(), identity.class },
+    \\            );
+    \\            return error.GateTableMismatch;
+    \\        }
+    \\        if (identity.machine != elf_machine) {
+    \\            std.log.err(
+    \\                "'{s}': build script e_machine {d}, module triple '{s}' means e_machine {d}",
+    \\                .{ name, elf_machine, abi.triple(), identity.machine },
     \\            );
     \\            return error.GateTableMismatch;
     \\        }
     \\    }
-    \\    // `-Dabi=` must name an ABI the module also knows, not only one this
-    \\    // file knows, or the two could diverge with nothing to notice.
-    \\    if (abiByDirectoryName(wanted) == null) {
-    \\        std.log.err("'{s}' is not an ABI of this NDK", .{wanted});
-    \\        return error.UnsupportedAbi;
-    \\    }
+    \\}
+    \\
+    \\/// The Zig CPU architecture tag, ELF class and `e_machine` that an NDK
+    \\/// sysroot triple implies.
+    \\///
+    \\/// The only NDK-specific knowledge here is that a triple's architecture
+    \\/// is its first field and that `i686` is how `x86` spells itself in a
+    \\/// sysroot triple while it is `x86` in Zig. Every number is `std.elf`'s,
+    \\/// and the triple is the module's.
+    \\const ElfIdentity = struct {
+    \\    cpu_arch: []const u8,
+    \\    class: u8,
+    \\    machine: u16,
+    \\};
+    \\
+    \\fn identityForTriple(triple: []const u8) ?ElfIdentity {
+    \\    const dash = std.mem.indexOfScalar(u8, triple, '-') orelse return null;
+    \\    const arch = triple[0..dash];
+    \\    const cpu_arch = if (std.mem.eql(u8, arch, "i686")) "x86" else arch;
+    \\    const class: std.elf.CLASS = if (std.mem.eql(u8, cpu_arch, "arm") or
+    \\        std.mem.eql(u8, cpu_arch, "x86")) .@"32" else .@"64";
+    \\    const machine: std.elf.EM = blk: {
+    \\        if (std.mem.eql(u8, cpu_arch, "aarch64")) break :blk .AARCH64;
+    \\        if (std.mem.eql(u8, cpu_arch, "arm")) break :blk .ARM;
+    \\        if (std.mem.eql(u8, cpu_arch, "x86")) break :blk .@"386";
+    \\        if (std.mem.eql(u8, cpu_arch, "x86_64")) break :blk .X86_64;
+    \\        if (std.mem.eql(u8, cpu_arch, "riscv64")) break :blk .RISCV;
+    \\        return null;
+    \\    };
+    \\    return .{
+    \\        .cpu_arch = cpu_arch,
+    \\        .class = @intFromEnum(class),
+    \\        .machine = @intFromEnum(machine),
+    \\    };
     \\}
     \\
 ;

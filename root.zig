@@ -16,8 +16,8 @@
 //! Usage from a dependent build.zig:
 //!
 //! ```zig
-//! const ndk_dep = b.dependency("zig-ndk", .{});
-//! const zig_ndk = @import("zig-ndk");
+//! const ndk_dep = b.dependency("zig_ndk", .{});
+//! const zig_ndk = @import("zig_ndk");
 //!
 //! Facts, for your own Zig code: Abi, HostTag, Ndk, LibcPaths, Error.
 //! exe.root_module.addImport("ndk", ndk_dep.module("ndk"));
@@ -31,12 +31,20 @@
 //!     // that order
 //! });
 //! ```
+//! The package name is `zig_ndk`, underscore: `build.zig.zon` declares
+//! `.name = .zig_ndk` as an enum literal, and Zig 0.16 derives the dependency
+//! name from that token. A hyphen is not another spelling of it. Spelling it
+//! that way panics the dependent's build script with "no dependency named
+//! 'zig-ndk'", before any of this package's code runs.
 //!
 //! `linkAndroid` does the discovery, renders the libc paths file through
 //! `LibcPaths`, writes it into the build cache, and sets
 //! `compile.root_module.link_libc` so the runner emits `-lc`. Call it once per
-//! compilation: a second call builds a second paths-file helper for the same
-//! module and Zig reports duplicate module instances. It does **not** pass
+//! compilation: a second call on the same `compile` is refused with
+//! `error.AlreadyLinked`, because `Compile.setLibCFile` is last-call-wins. A
+//! silent replacement is worse than a wrong one — an API-24 CRT directory
+//! under a target query that says API 35 links into an undefined `statx`
+//! instead of into a diagnosable error. It does **not** pass
 //! `--sysroot` — `b.sysroot` is a whole-`Build`
 //! field, so setting it would leak this NDK into every other compilation in
 //! your build, and the sysroot is fully expressed by the paths file's CRT
