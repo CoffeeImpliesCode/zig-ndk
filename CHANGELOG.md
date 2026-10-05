@@ -354,19 +354,60 @@ revisit the mechanism: at 0.17.0 re-read `Step/Compile.zig` around
 `generated_bin` before trusting that `-fno-emit-bin` is still appended on the
 same condition.
 
+### p0010 — one piece of Zig's MIT code is reproduced, and attributed
+
+The `render` template in `src/libc_file.zig` is 26 contiguous lines
+byte-for-byte identical to `std.zig.LibCInstallation.render` at 0.16.0,
+comment block included — the eleven prose lines and the upstream "include
+directories **be found**" grammar quirk among them. `test/integration_test.zig`
+reproduces one more line, identical to `LibCInstallation.zig:62`.
+
+This is redistribution under a compatible licence, not a defect, and it is
+deliberate: a paths file this package writes has to be indistinguishable from
+one Zig writes itself, which is what `render`'s doc comment says and what a test
+asserts. It is recorded here because those comment lines are **written into the
+generated `ndk-libc.txt`**, so a user who opens that file in their build cache
+reads Zig's words with no attribution in the file itself. `NOTICE.md` is where
+the attribution lives, and `LICENSE`'s preamble states what the tree does and
+does not ship.
+
+**What this package does not ship:** any NDK, Google or LLVM artefact. No C, no
+NDK header, no vendored LLVM, and the 783 MB archive is downloaded at build time
+and never committed. The NDK itself is neither MIT nor free — nixpkgs
+classifies it as unfree, and Google distributes it under the Android SDK Terms
+at <https://developer.android.com/studio/terms>. `devenv.nix` and the CI `link`
+job both fetch and unpack r29 under those terms, and `devenv.nix` runs
+`chmod -R u+w` across it. **No one working on this package has read those
+terms**, so nothing here states what they permit or forbid; the claim is only
+that the download happens.
+
+**Enforcer: the CI licence job, which fails if a C source, a vendored header or
+a `UPSTREAM` file appears**, plus `NOTICE.md` existing as the attribution
+record. Neither enforces the byte-identity above, which is not a property that
+should be enforced — only recorded. What would revisit this entry is a compiler
+bump: at 0.17.0, `render` is re-read against the new `LibCInstallation.render`
+and the twenty-six lines re-diffed, since that is exactly the change that would
+silently move them.
+
+
 ## Deferred, with reasons
 
 Known, and not done. Recording them is more useful than leaving them implied.
 
-- **Per-ABI link proof for four of the five ABIs.** `ndk-link-check` was
-  observed linking `arm64-v8a` at API 35: `zig-out/bin/ndk-link-check` is
-  written and passes the ELF-header check, and `file(1)` reads it as an
-  aarch64 Android PIE with interpreter `/system/bin/linker64`, for Android 35,
-  built by NDK r29 (14206865). `ndk-abi-check` *compiles* the other four, which
-  is a different claim from having watched each one link. `-Dabi=<name>` and
-  `-Dapi=<n>` are what close that, with `-Dapi=35` required for `riscv64`
-  (p0006). Until each has been run, per-ABI coverage is the open question, not
-  the mechanism.
+- **Per-ABI link proof for three of the five ABIs.** `ndk-link-check` was
+  observed linking `arm64-v8a` and `riscv64`, both at API 35: in each case
+  `zig-out/bin/ndk-link-check` is written and passes the ELF-header check, and
+  `file(1)` reads the arm64 one as an aarch64 Android PIE with interpreter
+  `/system/bin/linker64`, for Android 35, built by NDK r29 (14206865).
+  `ndk-abi-check` *compiles* the other three, which is a different claim from
+  having watched each one link. `-Dabi=<name>` and `-Dapi=<n>` are what close
+  that. **The API-21 legs do not link as the package is configured**:
+  `armeabi-v7a`, `x86` and `arm64-v8a` fail on `undefined symbol: preadv64`,
+  `x86_64` on `pwritev64`. Bionic gained both at API 24 and Zig's default panic
+  handler reaches them, so those legs want `-Dapi=35` or
+  `-Doptimize=ReleaseSmall`. That is a property of bionic, not of the sysroot
+  description this package provides — but it does mean per-ABI coverage is the
+  open question, not the mechanism.
 - **No gate reads past the ELF header.** `ndk-elf-check` confirms the magic,
   `EI_CLASS`, `EI_DATA`, `EI_OSABI` and `e_machine`, which is enough to refuse a
   host artefact or one for the wrong ABI. It does not parse the program headers

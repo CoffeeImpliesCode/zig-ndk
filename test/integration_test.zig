@@ -476,10 +476,10 @@ test "the six-field libc paths file built from a resolved sysroot parses, and ma
 }
 
 // ---------------------------------------------------------------------------
-// 3. Discovery order
+// 3. Discovery: order, the explicit pin, and candidate trimming
 // ---------------------------------------------------------------------------
 
-test "discovery reads the build option first, then the three variables in the documented order" {
+test "a present build option wins, and the three variables are read in the documented order" {
     // The defect this catches: the order is a promise about which NDK a build
     // silently uses. Swap two entries and a machine with an inherited
     // `ANDROID_NDK_HOME` starts linking a different libc with no diagnostic
@@ -568,9 +568,11 @@ test "discovery reads the build option first, then the three variables in the do
         try testing.expectEqualStrings(option.root, found.root_path);
     }
 
-    // A candidate that is not on disk at all is skipped rather than fatal, so
-    // an unset-but-stale variable falls through to the next source instead of
-    // ending discovery.
+    // An absent IMPLICIT candidate is skipped rather than fatal, so an
+    // unset-but-stale variable hands the turn to the next source instead of
+    // ending discovery. The same path named as `-Dndk` is fatal instead, and
+    // that half of the rule is pinned by the next test, which exists to make
+    // the difference impossible to miss.
     {
         var stale = try Fixture.init(gpa);
         defer stale.deinit();
@@ -582,8 +584,140 @@ test "discovery reads the build option first, then the three variables in the do
         });
         const from_root = try Ndk.find(gpa, testing.io, null, &environ);
         try testing.expectEqualStrings(root.root, from_root.root_path);
-        const past_missing = try Ndk.find(gpa, testing.io, missing, &environ);
-        try testing.expectEqualStrings(root.root, past_missing.root_path);
+    }
+}
+
+test "an absent explicit -Dndk stops the walk and an absent variable does not" {
+    // The defect this catches: an explicit `-Dndk` and an inherited
+    // `ANDROID_NDK_HOME` naming the SAME missing path used to have the same
+    // answer, because both were "not on disk" and neither was fatal. The
+    // option the user typed on purpose was dropped without a word and the
+    // build linked whatever libc the shell happened to export — the whole
+    // point of naming a path explicitly is that it is a pin, not a preference.
+    //
+    // Two `find` calls, one absent path, one environment map. Nothing else
+    // differs between them: same host, same scratch trees, same bytes. Only
+    // the ROLE of the missing path differs, and the roles answer differently.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    const host = (try findHostTag()) orelse {
+        const empty = try environOf(gpa, &[_][2][]const u8{});
+        try testing.expectError(error.UnsupportedHost, Ndk.find(gpa, testing.io, null, &empty));
+        return;
+    };
+
+    var scratch = try Fixture.init(gpa);
+    defer scratch.deinit();
+    var option = try Fixture.init(gpa);
+    defer option.deinit();
+
+    _ = try createTree(&option, gpa, host, .direct, .x86_64, &.{"21"});
+    const missing = try path.join(gpa, &.{ scratch.root, "not-installed" });
+
+    const environ = try environOf(gpa, &.{
+        .{ "ANDROID_NDK_HOME", missing },
+        .{ "ANDROID_NDK_ROOT", option.root },
+    });
+
+    // Named as the build option. There is nothing behind it, so the walk stops
+    // here rather than handing back an NDK the caller never asked for.
+    try testing.expectError(error.NdkNotFound, Ndk.find(gpa, testing.io, missing, &environ));
+
+    // Named as a variable nobody necessarily authored for this build. The
+    // walk moves on and the next source answers.
+    const from_root = try Ndk.find(gpa, testing.io, null, &environ);
+    try testing.expectEqualStrings(option.root, from_root.root_path);
+
+    // The pin holds with nothing else set, where the walk would otherwise end
+    // in the same error for an unrelated reason.
+    const empty = try environOf(gpa, &[_][2][]const u8{});
+    try testing.expectError(error.NdkNotFound, Ndk.find(gpa, testing.io, missing, &empty));
+
+    // An option that names nothing is not a pin. `-Dndk=` and a value that is
+    // only whitespace are the same statement, and both are skipped the way an
+    // unset variable is, because refusing on them would break a caller whose
+    // fallback the walk can satisfy.
+    try testing.expectEqualStrings(
+        option.root,
+        (try Ndk.find(gpa, testing.io, "", &environ)).root_path,
+    );
+    try testing.expectEqualStrings(
+        option.root,
+        (try Ndk.find(gpa, testing.io, " \t\r\n", &environ)).root_path,
+    );
+}
+
+test "a candidate is trimmed of trailing CR, LF and surrounding whitespace before probing" {
+    // The defect this catches: a value that came out of a file rather than a
+    // command line carries its terminator with it, and a path with one byte
+    // of `\n` on the end is a path that is not on disk. Untrimmed, the walk
+    // treats the real NDK as absent and answers from a source the caller never
+    // named — for an explicit candidate that is a build linking a different
+    // libc over a stray newline in `.env`.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    const host = (try findHostTag()) orelse {
+        const empty = try environOf(gpa, &[_][2][]const u8{});
+        try testing.expectError(error.UnsupportedHost, Ndk.find(gpa, testing.io, null, &empty));
+        return;
+    };
+
+    var trailing_lf = try Fixture.init(gpa);
+    defer trailing_lf.deinit();
+    var trailing_crlf = try Fixture.init(gpa);
+    defer trailing_crlf.deinit();
+    var padded = try Fixture.init(gpa);
+    defer padded.deinit();
+
+    _ = try createTree(&trailing_lf, gpa, host, .direct, .x86, &.{"21"});
+    _ = try createTree(&trailing_crlf, gpa, host, .direct, .x86_64, &.{"21"});
+    _ = try createTree(&padded, gpa, host, .direct, .arm64_v8a, &.{"21"});
+
+    // A trailing LF, which is what a `.env` file and a Makefile both leave
+    // behind. Probed as an implicit candidate...
+    {
+        const environ = try environOf(gpa, &.{
+            .{ "ANDROID_NDK_HOME", try std.fmt.allocPrint(gpa, "{s}\n", .{trailing_lf.root}) },
+        });
+        const found = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(trailing_lf.root, found.root_path);
+    }
+
+    // ...and a CRLF pair, which is what a file written on Windows leaves
+    // behind. Both bytes go, not just the LF, so this fails a trim that
+    // splits on one scalar.
+    {
+        const environ = try environOf(gpa, &.{
+            .{ "ANDROID_NDK_ROOT", try std.fmt.allocPrint(gpa, "{s}\r\n", .{trailing_crlf.root}) },
+        });
+        const found = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(trailing_crlf.root, found.root_path);
+    }
+
+    // Surrounding spaces, which is what quoting a path inside a value in a
+    // shell leaves behind. The result is the trimmed path, so `root_path` is
+    // usable as-is and does not carry the padding into the sysroot path.
+    {
+        const environ = try environOf(gpa, &.{
+            .{ "ANDROID_NDK", try std.fmt.allocPrint(gpa, "  {s}  ", .{padded.root}) },
+        });
+        const found = try Ndk.find(gpa, testing.io, null, &environ);
+        try testing.expectEqualStrings(padded.root, found.root_path);
+    }
+
+    // The build option is trimmed the same way, and a present-and-padded
+    // candidate still outranks the variables — trimming does not demote it.
+    {
+        const environ = try environOf(gpa, &.{
+            .{ "ANDROID_NDK_HOME", trailing_crlf.root },
+        });
+        const explicit = try std.fmt.allocPrint(gpa, "\t{s}\t\n", .{trailing_lf.root});
+        const found = try Ndk.find(gpa, testing.io, explicit, &environ);
+        try testing.expectEqualStrings(trailing_lf.root, found.root_path);
     }
 }
 
@@ -595,9 +729,17 @@ test "a candidate that is not on disk yields NdkNotFound" {
     // The defect this catches: `NotAnNdk` and `NdkNotFound` are different
     // problems with different fixes, and conflating them sends a user to
     // inspect an NDK that was never the problem. `Ndk.open` maps a missing
-    // root onto `NotAnNdk` on purpose — it has nowhere else to go — so only
-    // the discovery walk, which has another candidate to try, reports that
-    // nothing was found at all.
+    // root onto `NotAnNdk` on purpose — it has nowhere else to go — so the
+    // discovery walk reports that nothing was found at all.
+    //
+    // The walk reaches that answer on two different grounds, and telling them
+    // apart is the contract. An absent EXPLICIT candidate stops the walk where
+    // it stands, because the user named that path deliberately and a build
+    // that quietly links a different NDK is worse than one that stops. An
+    // absent IMPLICIT candidate does not stop it: the environment is
+    // inherited rather than authored for this build, and a stale
+    // `ANDROID_NDK_HOME` left over from an uninstall hands the turn to the
+    // next source instead of ending discovery.
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
@@ -622,6 +764,8 @@ test "a candidate that is not on disk yields NdkNotFound" {
         .{ "ANDROID_NDK", missing },
     });
     try testing.expectError(error.NdkNotFound, Ndk.find(gpa, testing.io, null, &environ));
+    // The same absent path as `-Dndk`, with three valid-looking siblings
+    // behind it that the walk is not allowed to reach.
     try testing.expectError(error.NdkNotFound, Ndk.find(gpa, testing.io, missing, &environ));
 }
 

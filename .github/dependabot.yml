@@ -1,0 +1,17 @@
+# A SHA pin does not update itself. Every `uses:` in ci.yml names a commit, with
+# the action's tag beside it as a label for the reader — which is exactly why
+# the tag cannot be what the workflow runs: move refs/tags/v4 and the label goes
+# stale while the pin stays put, and nothing turns red to say so.
+#
+# This file is what turns that silence into a pull request: weekly, for the
+# GitHub Actions ecosystem, over the workflow directory at the repository root.
+# A bump arrives as one changed SHA per line, so reviewing it is reading the
+# action's own release notes, checking that the SHA is the commit the tag names,
+# and keeping the `# v4` label with it.
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

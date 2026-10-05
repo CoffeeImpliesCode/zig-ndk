@@ -17,8 +17,15 @@
 # the only job that runs a gate needing one: ndk-link-check reads a sysroot,
 # and sync-ndk compares this package's recorded release, digests and ABI
 # table against a real unpacked NDK. Both run there, on one download. The
-# other three gates prove something that needs no NDK at all, and a green run
+# other four gates prove something that needs no NDK at all, and a green run
 # for each is the evidence that the sysroot stays optional.
+#
+# One job runs no `zig build` step at all. `consumer` builds this package as a
+# DEPENDENCY of a throwaway project written into the runner's temp directory,
+# which is the only route here that can catch a consumer-facing API change, a
+# file missing from `.paths`, or a fingerprint that fits this tree and nothing
+# else — every other job compiles the repository against itself, where all of
+# those stay green. Host target, no NDK, no sysroot.
 #
 # --- Known gap: foundation contract §4.3 item 5, Tier-2 host targets --------
 # The contract asks for cross-compilation gates on x86_64-linux (Tier 1) and
@@ -34,10 +41,10 @@
 # this comment is the disclosure — a red job would say less.
 #
 # The closing mechanism is not settled. build.zig's `test` step already
-# degrades to compile-only under a foreign `-Dtarget` (build.zig:181-194:
-# `isNative()` false means it depends on the compile, logs that it did not
-# run, and does not fail), so `zig build test -Dtarget=aarch64-linux` is the
-# obvious candidate — but no CI run has proven this package compiles for
+# degrades to compile-only under a foreign `-Dtarget` (build.zig's `isNative`
+# branch of that step: false means it depends on the compile, logs that it did
+# not run, and does not fail), so `zig build test -Dtarget=aarch64-linux` is
+# the obvious candidate — but no CI run has proven this package compiles for
 # those triples, and a gate that has never been green is not a gate. It is
 # left unwired rather than wired and red.
 name: CI
@@ -74,10 +81,12 @@ env:
   # branch, so the workflow cannot move under a green run. The other two fields
   # are not pins and must not be described as one.
   #
-  #   .minimum_zig_version   advisory. Zig parses and stores it and nothing
-  #                          acts on it (doc/build.zig.zon.md:65), so a 0.17
-  #                          build would not be refused by it.
-  #   zig_0_16               a floating nixpkgs attribute (devenv.nix:61). It
+  #   .minimum_zig_version   advisory. build.zig.zon:15 states 0.16.0 and
+  #                          nothing acts on it: across the 0.16.0 lib tree the
+  #                          only occurrence is zig init's own template
+  #                          (lib/init/build.zig.zon:28), so a 0.17 build
+  #                          would not be refused by it.
+  #   zig_0_16               a floating nixpkgs attribute (devenv.nix:90). It
   #                          resolves to whatever devenv.lock's nixpkgs-src rev
   #                          provides, currently
   #                          c7def046b9a883d46974757852106483d741586f, so the
@@ -104,10 +113,20 @@ env:
   ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
 
   # --- Compiler record for the pinned Android NDK -------------------------
-  # Both values are facts about one artefact, not choices, and both are recorded
-  # in tools/ndk.sha256, which tools/sync-ndk.sh re-resolves and fails if either
-  # moves. They live here as workflow-level constants so a reviewer sees the
-  # whole pin — version code and hash — in one place.
+  # Facts about one artefact, not choices. Each of the three constants below is
+  # a fact tools/ndk.sha256 pins, and that file re-resolves all five of its own
+  # through tools/sync-ndk.sh, failing if any is missing or moves. Two facts it
+  # pins that this workflow does not mirror: `release`, which survives here only
+  # inside NDK_ZIP_URL, and Google's sha1. The URL is deliberately not pinned in
+  # that file, which says why, so the hash, length and revision checks in the
+  # link job are what hold the bytes to the pin.
+  #
+  # A bump moves NDK_ZIP_URL and these three constants AND the pin file's five
+  # lines in one commit. Move only the workflow's and the drift gate in the link
+  # job below looks for the OLD release's archive name, because the script
+  # builds that name from the pin file, not from the URL: it fails with "no NDK
+  # archive found", and then names the disagreement it found — the tree at the
+  # NDK root reports the new release while the pin still records the old one.
   #
   #   NDK_VERSION_CODE  source.properties, Pkg.Revision, NDK r29
   #   NDK_ZIP_SHA256    the published linux-x86_64 zip, as downloaded
@@ -116,6 +135,34 @@ env:
   NDK_ZIP_SHA256: "4abbbcdc842f3d4879206e9695d52709603e52dd68d3c1fff04b3b5e7a308ecf"
   NDK_ZIP_SIZE: "783549481"
 
+# --- What is pinned in this file ---------------------------------------------
+# Two things, and neither of them is a tag.
+#
+# 1. Every `uses:` names a commit, with the tag beside it as a label for the
+#    reader: `uses: mlugg/setup-zig@<sha> # v2` runs that commit and no other.
+#    A tag is a mutable name — force-push refs/tags/v2 and all four build jobs
+#    run new code, ahead of every gate that would notice, until a human edits
+#    the SHA. For mlugg/setup-zig that push is cheap rather than theoretical:
+#    `gh api repos/mlugg/setup-zig` reports "mirror_url": null and describes
+#    the GitHub repository as a read-only mirror of
+#    https://codeberg.org/mlugg/setup-zig, and a null mirror_url means GitHub
+#    is not syncing it, so it is pushed by hand. It is third-party JavaScript
+#    in all four jobs, and in the link job it runs before the NDK is unpacked.
+#    actions/checkout and actions/cache are GitHub's own, so moving them needs
+#    staff compromise rather than a tag push — they are pinned to the same
+#    standard anyway, because one rule is worth more than two.
+#    The SHA is the pin. The `# v4` / `# v2` beside it is a label, and
+#    .github/dependabot.yml is what proposes the next SHA before a pin can
+#    outlive the release it names.
+#
+# 2. Every checkout passes `persist-credentials: false`. By default the action
+#    writes GITHUB_TOKEN into .git/config as an http extraheader and leaves it
+#    there for the rest of the job — including the steps that run the
+#    contributor's own build script, which can read the token back out of
+#    .git/config. `permissions: contents: read` bounds what that token can do
+#    today; it should not be the only thing between a token and a pull request
+#    that gets to read one.
+#
 jobs:
   # ---------------------------------------------------------------------------
   fmt:
@@ -123,13 +170,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes; the token must not outlive the fetch.
+          persist-credentials: false
 
       # Canonical home is https://codeberg.org/mlugg/setup-zig; the
       # github.com/mlugg/setup-zig repository is its labelled read-only mirror
-      # and is what GitHub Actions can resolve. Pin the v2 tag.
+      # and is what GitHub Actions can resolve — and "labelled" is all it is:
+      # `mirror_url` is null in `gh api repos/mlugg/setup-zig`, so GitHub does
+      # not sync it and someone pushes it by hand. The SHA below is what this
+      # workflow runs; the `# v2` beside it is only there to be read.
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
           # The action's own cache is hardcoded to $GITHUB_WORKSPACE/.zig-cache
@@ -147,7 +200,7 @@ jobs:
           # so the gate uses the same directory devenv.nix names.
           echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
           key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -167,10 +220,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes; the token must not outlive the fetch.
+          persist-credentials: false
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
           use-cache: false
@@ -181,7 +237,7 @@ jobs:
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
           echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
           key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -197,10 +253,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes; the token must not outlive the fetch.
+          persist-credentials: false
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
           use-cache: false
@@ -211,7 +270,7 @@ jobs:
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
           echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
           key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -269,10 +328,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes; the token must not outlive the fetch.
+          persist-credentials: false
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
           use-cache: false
@@ -283,7 +345,7 @@ jobs:
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
           echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
           key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -295,15 +357,46 @@ jobs:
           NDK_ZIP_URL: https://dl.google.com/android/repository/android-ndk-r29-linux.zip
         run: |
           set -euo pipefail
-          zip="$RUNNER_TEMP/ndk.zip"
-          curl --fail --location --retry 3 --show-error --output "$zip" "$NDK_ZIP_URL"
-          echo "${NDK_ZIP_SHA256}  ${zip}" | sha256sum --check --strict -
-          test "$(stat -c %s "$zip")" -eq "${NDK_ZIP_SIZE}"
+          # The archive is saved BESIDE the directory it unpacks into, because
+          # tools/sync-ndk.sh hashes the published archive to prove the release
+          # identity and looks for exactly one place first
+          # (tools/sync-ndk.sh, its first archive candidate,
+          # <ndk-root>/../android-ndk-<release>-linux.zip):
+          # Keep it at $RUNNER_TEMP/ndk.zip and the drift gate below refuses
+          # with "no NDK archive found" on every runner: that candidate
+          # resolves inside $RUNNER_TEMP/ndk, one directory lower than where
+          # the old path put the archive.
+          # The name comes from the URL, so the file and the release it came
+          # from cannot drift apart in this file.
+          zip="$RUNNER_TEMP/ndk/${NDK_ZIP_URL##*/}"
           mkdir -p "$RUNNER_TEMP/ndk"
+          # HTTPS on every hop. curl's default --proto-redir still permits http,
+          # so one redirect under a hostile CDN could move 783 MB to plaintext.
+          # That is not code execution — the SHA-256 below is verified before
+          # anything reads the file — but a man-in-the-middle can stall or
+          # flood the transfer and burn this job's 45-minute budget.
+          # --max-time caps one attempt at 15 of the job's 45 minutes, and
+          # --retry-all-errors makes the transient half of a failure (a reset,
+          # a 5xx, a timeout) cost one retry instead of the whole job.
+          curl --fail --location \
+            --proto '=https' --proto-redir '=https' \
+            --retry 3 --retry-all-errors --max-time 900 \
+            --show-error --output "$zip" "$NDK_ZIP_URL"
+          echo "${NDK_ZIP_SHA256}  ${zip}" | sha256sum --check --strict -
+          test "$(stat -c %s "$zip")" -eq "${NDK_ZIP_SIZE}" || {
+            echo "::error::${zip} is $(stat -c %s "$zip") bytes; the pin says ${NDK_ZIP_SIZE}. A download that ended early is the usual cause."
+            exit 1
+          }
           unzip -q "$zip" -d "$RUNNER_TEMP/ndk"
           ndk_home="$(find "$RUNNER_TEMP/ndk" -mindepth 1 -maxdepth 1 -type d -name 'android-ndk-*')"
-          test -n "${ndk_home}"
-          test -d "${ndk_home}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          test -n "${ndk_home}" || {
+            echo "::error::${zip} unpacked to no android-ndk-* directory; the archive is not the one this job expects"
+            exit 1
+          }
+          test -d "${ndk_home}/toolchains/llvm/prebuilt/linux-x86_64/sysroot" || {
+            echo "::error::${ndk_home} carries no linux-x86_64 sysroot; nothing downstream can link against it"
+            exit 1
+          }
           # A hash pins the bytes; the revision pins what those bytes claim to
           # be. Read it back out of the artefact rather than trusting the file
           # name, and require every copy in the zip to agree with the pin.
@@ -335,10 +428,16 @@ jobs:
       - name: Assert the recorded NDK facts still describe this NDK
         run: zig build sync-ndk -Dndk="${ANDROID_NDK_HOME}"
 
-      # ANDROID_NDK_HOME is the first candidate in build.zig's discovery order;
-      # -Dndk is the explicit override above all four, so both the environment
-      # route a consumer would take and the flag route a packager would take
-      # are exercised by the same run.
+      # Both gates pass -Dndk, and resolveNdkRoot's explicit branch returns
+      # that path before it ever reads the environment (build.zig), so the
+      # ANDROID_NDK_HOME exported above is NOT what selects the NDK in this
+      # run: the environment candidates are never consulted. The variable is
+      # exported anyway, because it is the route a consumer takes and the path
+      # this job reports. The library's own discovery order IS covered, by
+      # test/integration_test.zig, which injects an Environ.Map; build.zig's
+      # copy of that order — its own `ndk_env_vars` walk — is covered by
+      # nothing, because no test runs build.zig. Re-proving it here would cost
+      # a second 783 MB download, so this line is where that gap is recorded.
       - name: libc link gate
         run: zig build ndk-link-check -Dndk="${ANDROID_NDK_HOME}"
 
@@ -348,38 +447,216 @@ jobs:
   # a hard reject; NOASSERTION is a reject until someone resolves it. The rule
   # lives in CI because a relicensing pull request is otherwise invisible in a
   # diff of source files.
+  #
+  # What it reads: every tracked file whose NAME carries a licence word —
+  # LICENSE, LICENCE, COPYING, COPYRIGHT, docs/LICENSE, foo.licence, at any
+  # depth. On this tree that set is exactly `LICENSE`. Source files are
+  # deliberately not read: a `///` doc comment, or the word MIT in a README, is
+  # not a licence, and grepping them would turn this package's own prose into a
+  # licence claim. A file carrying licence text under a name none of these
+  # match is invisible to this gate, and this comment does not claim otherwise.
+  #
+  # Four tests per file, and what each is for:
+  #
+  #   1. no GPL-family name, in any spelling. The old pattern ended in \b, and
+  #      \b cannot match between `gpl` and the v of `GPLv3` — both are word
+  #      characters — so the exact spelling a relicensing pull request writes
+  #      passed. The fused spelling is an explicit alternative now, and GFDL is
+  #      named outright, because it is copyleft too and went uncaught.
+  #   2. no NOASSERTION.
+  #   3. an allowlisted licence NAME, spelled as each licence spells it.
+  #   4. that licence's GRANT TEXT, actually present. A name alone detects a
+  #      rename, not a mutilation: a LICENSE reduced to the single word MIT
+  #      passed, and an intact MIT whose title line was stripped failed. One
+  #      marker per allowlisted family, so an Apache tree is never asked for
+  #      MIT's sentence.
   licence:
     name: licence
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes; the token must not outlive the fetch.
+          persist-credentials: false
 
       - name: Licence allowlist
         run: |
           set -euo pipefail
-          test -s LICENSE || { echo "::error::LICENSE is missing or empty"; exit 1; }
 
-          # Match both the abbreviation and the spelled-out title: a rejection
-          # that only sees "GPLv3" misses "GNU General Public License Version 3",
-          # which is the same licence.
-          if grep -Eqi '\b(a|l)?gpl\b|(general|lesser|affero)[[:space:]]+public[[:space:]]+licen[cs]e' LICENSE; then
-            echo "::error::LICENSE names a GPL or LGPL licence; foundation §4.3 item 8 hard-rejects it."
+          mapfile -t licence_files < <(
+            git ls-files |
+              grep -Ei '(^|/)(licen[cs]e|copying|copyright)[^/]*$|\.(licen[cs]e|copying)$' |
+              LC_ALL=C sort
+          )
+          if [ "${#licence_files[@]}" -eq 0 ]; then
+            echo "::error::no tracked file carries a licence name; this package has no licence to gate"
             exit 1
           fi
 
-          if grep -q NOASSERTION LICENSE; then
-            echo "::error::LICENSE is unresolved (NOASSERTION); foundation §4.3 item 8 rejects it until resolved."
-            exit 1
-          fi
-
-          # Match each licence as it actually writes its name, not only the SPDX
-          # hyphenated form: "Apache License Version 2.0" grants the same rights
-          # as "Apache-2.0" and must not fail the gate.
+          # 1. GPL family in every spelling, fused included: GPLv3, LGPLv3,
+          #    AGPLv3, gpl3, GPLv2+, LGPLv2.1. GFDL is named outright.
+          reject='\b(a|l)?gpl\b|\b(a|l)?gpl[-_ ]?v?[0-9]|\bgfdl\b|gnu[[:space:]]+free[[:space:]]+documentation[[:space:]]+licen[cs]e|(general|lesser|affero)[[:space:]]+public[[:space:]]+licen[cs]e'
+          # 3. Match each licence as it actually writes its name, not only the
+          # SPDX hyphenated form: "Apache License Version 2.0" grants the same
+          # rights as "Apache-2.0" and must not fail the gate.
           allowed='MIT|ISC|BSD(-[23])?(-[Cc]lause)?|Zlib|Apache-2\.0|Apache[[:space:]]+[Ll]icen[cs]e|Boost[[:space:]]+[Ss]oftware[[:space:]]+[Ll]icen[cs]e|BSL-1\.0|public[- ]domain|[Uu]nlicense|CC0-1\.0'
-          if ! grep -Eqi "(^|[^A-Za-z0-9-])(${allowed})([^A-Za-z0-9-]|$)" LICENSE; then
-            echo "::error::LICENSE carries no allowlisted licence name; foundation §4.3 item 8 accepts MIT, ISC, BSD-2, BSD-3, Zlib, Apache-2.0, BSL-1.0, public domain and Unlicense only."
-            exit 1
-          fi
+          # 4. The grant line each allowlisted family is recognised by.
+          grant='Permission is hereby granted, free of charge|Permission to use, copy, modify|Licensed under the Apache License, Version 2\.0|Redistribution and use in source and binary forms|altered source versions must be plainly marked|released into the public domain'
 
-          echo "licence gate: allowlisted identifier found in LICENSE"
+          for file in "${licence_files[@]}"; do
+            test -s "$file" || { echo "::error::${file} is empty"; exit 1; }
+
+            if grep -Eqi "$reject" "$file"; then
+              echo "::error::${file} names a GPL or LGPL licence; foundation §4.3 item 8 hard-rejects it."
+              exit 1
+            fi
+
+            if grep -q NOASSERTION "$file"; then
+              echo "::error::${file} is unresolved (NOASSERTION); foundation §4.3 item 8 rejects it until resolved."
+              exit 1
+            fi
+
+            if ! grep -Eqi "(^|[^A-Za-z0-9-])(${allowed})([^A-Za-z0-9-]|$)" "$file"; then
+              echo "::error::${file} carries no allowlisted licence name; foundation §4.3 item 8 accepts MIT, ISC, BSD-2, BSD-3, Zlib, Apache-2.0, BSL-1.0, public domain and Unlicense only."
+              exit 1
+            fi
+
+            if ! grep -Eqi "$grant" "$file"; then
+              echo "::error::${file} names an allowlisted licence but carries none of its grant text, so it is a name and not a licence."
+              exit 1
+            fi
+
+            echo "licence gate: ${file} carries an allowlisted licence and its grant text"
+          done
+
+  # ---------------------------------------------------------------------------
+  # The route a consumer actually takes, and the only one no other job here
+  # walks: building this package as a DEPENDENCY instead of as a working tree.
+  # Every other job compiles this repository against itself, so all of these
+  # stay green there and break only for whoever fetches the package —
+  #
+  #   a consumer-facing name removed or renamed in root.zig or src/ndk.zig;
+  #   a file missing from build.zig.zon's `.paths`, which Build.path does not
+  #     detect, because it returns a LazyPath without touching the filesystem
+  #     and the failure waits for a step that needs it;
+  #   a .name or .fingerprint that satisfies this tree and no other;
+  #   a renamed or re-signed pub declaration in the build half, which no
+  #     in-tree caller can notice.
+  #
+  # The consumer is written into the runner's temp directory by heredoc, never
+  # into this repository and never committed: there is no such directory in the
+  # tree, which is why you will not find one. Its dependency is a PATH to this
+  # checkout, so what it proves is the consuming build — manifest validation,
+  # the module registry, the published surface — and not the packaging: it
+  # cannot fetch from a URL, and this comment does not claim it can.
+  #
+  # Host target, no NDK, no sysroot, no 783 MB: the point is that a stranger can
+  # depend on the package and call it, not that anything links.
+  consumer:
+    name: consumer (dependency route)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes; the token must not outlive the fetch.
+          persist-credentials: false
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+
+      - name: Pin the Zig cache to the repo-local directory
+        run: |
+          set -euo pipefail
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+          echo "ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR}" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ github.job }}-
+
+      - name: Build and run a throwaway consumer of the package
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/ndk-consumer"
+          rm -rf "$consumer"
+          mkdir -p "$consumer/src"
+
+          # A path dependency, and it has to be RELATIVE: Zig 0.16 refuses an
+          # absolute one with "expected path relative to build root". The
+          # consumer lives in the runner's temp directory, so the relative path
+          # is computed rather than spelled.
+          dep="$(realpath --relative-to="$consumer" "$GITHUB_WORKSPACE")"
+
+          cat >"$consumer/build.zig.zon" <<ZON
+          .{
+              .name = .consumer,
+              .version = "0.0.0",
+              // crc32("consumer"). This is the value `zig init` writes for a
+              // package of this name; a wrong one is not silent, Zig names the
+              // right value in its own error.
+              .fingerprint = 0x705b3727d964d897,
+              .minimum_zig_version = "0.16.0",
+              .dependencies = .{
+                  .zig_ndk = .{ .path = "$dep" },
+              },
+              .paths = .{ "build.zig", "build.zig.zon", "src" },
+          }
+          ZON
+
+          cat >"$consumer/build.zig" <<'BZ'
+          const std = @import("std");
+
+          pub fn build(b: *std.Build) void {
+              const target = b.standardTargetOptions(.{});
+              const optimize = b.standardOptimizeOption(.{});
+
+              // The whole point: the module comes from the dependency's own
+              // build.zig, by the name that build registers.
+              const dep = b.dependency("zig_ndk", .{});
+              const module = b.createModule(.{
+                  .root_source_file = b.path("src/main.zig"),
+                  .target = target,
+                  .optimize = optimize,
+              });
+              module.addImport("ndk", dep.module("ndk"));
+
+              const exe = b.addExecutable(.{
+                  .name = "ndk-consumer",
+                  .root_module = module,
+              });
+              b.installArtifact(exe);
+          }
+          BZ
+
+          # Enough of the published surface that removing a name breaks this:
+          # the module import itself, an Abi accessor, a HostTag accessor and
+          # something from Ndk. linkAndroid is deliberately absent — it needs a
+          # real NDK, and this job stays NDK-free.
+          cat >"$consumer/src/main.zig" <<'SRC'
+          const std = @import("std");
+          const ndk = @import("ndk");
+
+          pub fn main() !void {
+              const abi = ndk.Abi.arm64_v8a;
+              const tag = try ndk.Ndk.hostTag(@import("builtin").target);
+              std.debug.print("abi   {s} {s} api {d}\n", .{
+                  abi.directoryName(),
+                  abi.triple(),
+                  abi.minApiLevel(),
+              });
+              std.debug.print("host  {s} {s}\n", .{ @tagName(tag), tag.directoryName() });
+              std.debug.print("triple {s}\n", .{ndk.Ndk.tripleFor(abi)});
+          }
+          SRC
+
+          cd "$consumer"
+          zig build
+          ./zig-out/bin/ndk-consumer
