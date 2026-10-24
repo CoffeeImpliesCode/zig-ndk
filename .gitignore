@@ -4,3 +4,13 @@ zig-out/
 .devenv/
 .direnv/
 zig-pkg/
+result*
+__pycache__/
+*.pyc
+.ruff_cache/
+node_modules/
+target/
+*.o
+*.log
+core
+core.*
