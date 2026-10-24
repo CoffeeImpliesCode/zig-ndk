@@ -6,8 +6,8 @@ reproduced from the Zig standard library.
 
 ## Reproduced from Zig
 
-* **Origin:** `lib/std/zig/LibCInstallation.zig` in the Zig 0.16.0
-  distribution (tag `0.16.0`).
+* **Origin:** `lib/std/zig/LibCInstallation.zig` in the Zig 0.17.0
+  distribution (tag `0.17.0`).
 * **Copyright holder:** Zig contributors.
 * **Licence:** MIT (Expat) — the same terms as Zig's own `LICENSE`, reproduced
   in full below.
@@ -16,14 +16,10 @@ reproduced from the Zig standard library.
 
 Two fragments, each byte-for-byte identical to the file named above.
 
-* **The `render` output block** — the 25-line multiline format string at
-  `src/libc_file.zig:143-167`, of which fourteen lines are prose comments
-  (thirteen distinct; two of them carry the same wording). The same comment
-  text appears a second time, as the expected-output fixture of the test at
-  `src/libc_file.zig:338-363`.
-* **One line of code** — `if (line.len == 0 or line[0] == '#') continue;` at
-  `test/integration_test.zig:195`, identical to `LibCInstallation.zig:62`. It
-  is the tokenizer's filter for blank lines and `#` comments.
+* **The `render` output block** in `src/libc_file.zig`, including its comments
+  and expected-output test fixture.
+* **One line of code** — `if (line.len == 0 or line[0] == '#') continue;` in
+  `test/integration_test.zig`. It filters blank lines and `#` comments.
 
 Nothing else from `lib/std` is reproduced here. The remaining long lines this
 repository shares with `lib/std` — `self.* = undefined;`,

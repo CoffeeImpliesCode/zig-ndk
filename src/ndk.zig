@@ -1,6 +1,6 @@
-//! Android NDK discovery and layout facts for Zig 0.16.0.
+//! Android NDK discovery and layout facts for Zig 0.17.0.
 //!
-//! Zig 0.16.0 has no NDK awareness at all: `lib/std/Build.zig` never mentions
+//! Zig 0.17.0 has no NDK awareness at all: `lib/std/Build.zig` never mentions
 //! android, and `lib/libc/` ships darwin, freebsd, glibc, mingw, musl, netbsd,
 //! openbsd, wasi and include. There is no bionic. A freestanding
 //! `aarch64-linux-android` binary links; anything that needs `libc.so`, the CRT
@@ -416,7 +416,7 @@ pub const Ndk = struct {
         // allocation, and an arena — which is what every caller in this
         // repository passes — turns that mismatch into a silent no-op.
         const canonical: [:0]u8 = Dir.cwd().realPathFileAlloc(io, root_trimmed, gpa) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => try gpa.dupeZ(u8, root_trimmed),
+            error.FileNotFound, error.NotDir => try gpa.dupeSentinel(u8, root_trimmed, 0),
             else => |other| return other,
         };
         defer gpa.free(canonical);

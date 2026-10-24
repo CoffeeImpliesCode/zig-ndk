@@ -1,6 +1,6 @@
-//! zig-ndk — Android NDK sysroot facts, for Zig 0.16.0.
+//! zig-ndk — Android NDK sysroot facts, for Zig 0.17.0.
 //!
-//! Zig 0.16.0 ships no NDK awareness and bundles no bionic, so
+//! Zig 0.17.0 ships no NDK awareness and bundles no bionic, so
 //! `zig build-exe -target aarch64-linux-android -lc` fails with
 //! `error: unable to provide libc for target '…'`. This package closes that
 //! one gap and nothing wider: it describes where an unpacked Android NDK keeps
@@ -32,7 +32,7 @@
 //! });
 //! ```
 //! The package name is `zig_ndk`, underscore: `build.zig.zon` declares
-//! `.name = .zig_ndk` as an enum literal, and Zig 0.16 derives the dependency
+//! `.name = .zig_ndk` as an enum literal, and Zig derives the dependency
 //! name from that token. A hyphen is not another spelling of it. Spelling it
 //! that way panics the dependent's build script with "no dependency named
 //! 'zig-ndk'", before any of this package's code runs.
@@ -126,7 +126,7 @@ comptime {
     if (abis.len != 5) {
         @compileError(std.fmt.comptimePrint(
             "zig-ndk: the ABI table has {d} entries; r29's meta/abis.json has 5. " ++
-                "Re-read the NDK, then update tools/ndk.sha256 and CHANGELOG.md.",
+                "Re-read the NDK, then update tools/ndk.sha256 and CONTRACT.md.",
             .{abis.len},
         ));
     }

@@ -184,7 +184,7 @@ const default_link_api_level: u32 = 35;
 /// `AndroidLinkOptions.api_level`, which is where the measurement is recorded.
 const min_link_api_level: u32 = 24;
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -527,7 +527,7 @@ pub fn build(b: *std.Build) void {
         // anything at all. It also puts the executable where a reader can look
         // at it, `zig-out/bin/ndk-link-check`, instead of only inside a hash
         // directory in the cache.
-        const install_link = b.addInstallArtifact(link_exe, .{});
+        const install_link = b.addInstallArtifact(link_exe, .{ .dest_sub_path = link_artefact_name });
         link_check_step.dependOn(&install_link.step);
 
         // The part of the gate that can fail. A green build step is not a
@@ -550,8 +550,8 @@ pub fn build(b: *std.Build) void {
         const run_elf_check = b.addRunArtifact(elf_check);
         run_elf_check.addArgs(&.{
             "--abi",     gate.name,
-            "--class",   b.fmt("{d}", .{@intFromEnum(gate.elf_class)}),
-            "--machine", b.fmt("{d}", .{@intFromEnum(gate.elf_machine)}),
+            "--class",   b.fmt("{d}", .{@backingInt(gate.elf_class)}),
+            "--machine", b.fmt("{d}", .{@backingInt(gate.elf_machine)}),
         });
         // The WHOLE table, not just this row, and for a reason: the checker
         // validates its two expectation values against these rows, so the set
@@ -561,10 +561,10 @@ pub fn build(b: *std.Build) void {
         addGateRows(b, run_elf_check);
         // The path is the last argument, after the flags, the way the libc
         // paths helper takes its output path.
-        run_elf_check.addArg(b.getInstallPath(
-            install_link.dest_dir orelse .bin,
-            install_link.dest_sub_path,
-        ));
+        run_elf_check.addFileArg2(.{ .relative = .{
+            .base = .install_bin,
+            .sub_path = link_artefact_name,
+        } }, .{});
         // This run's argument is a path somebody else produced, not an output
         // argument of this run, so the build runner is free to cache the run
         // away and stop checking. See AGENTS.md §3 trap 2.
@@ -654,7 +654,8 @@ pub fn build(b: *std.Build) void {
         // relative `tools/sync-ndk.sh` would then be the consumer's file.
         // `pathFromRoot` joins `b.build_root` (Build.zig:1769-1772), which is
         // the directory holding THIS build.zig.
-        const run_sync = b.addSystemCommand(&.{ "bash", b.pathFromRoot("tools/sync-ndk.sh") });
+        const run_sync = b.addSystemCommand(&.{"bash"});
+        run_sync.addFileArg2(b.path("tools/sync-ndk.sh"), .{});
         run_sync.addArgs(&.{ "--ndk", ndk_root });
         // Both halves are stated rather than inferred. `.inherit` is the mode
         // std documents as failing on a non-zero exit, which is the property
@@ -678,11 +679,11 @@ pub fn build(b: *std.Build) void {
         "tools",
     };
 
-    const fmt_step = b.addFmt(.{ .paths = &fmt_paths });
+    const fmt_step = b.addFmt(.{ .paths = b.pathList(&fmt_paths) });
     b.step("fmt", "Format this package's own sources in place")
         .dependOn(&fmt_step.step);
 
-    const fmt_check_step = b.addFmt(.{ .paths = &fmt_paths, .check = true });
+    const fmt_check_step = b.addFmt(.{ .paths = b.pathList(&fmt_paths), .check = true });
     b.step("fmt-check", "Fail if any of this package's sources are unformatted")
         .dependOn(&fmt_check_step.step);
 
@@ -847,13 +848,13 @@ fn joinHostTagDirs(b: *std.Build) []const u8 {
 /// generic 24, or this ABI's own.
 fn linksBelowApiFloor(
     api_level: u32,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     gate: AbiGate,
 ) bool {
     if (api_level >= @max(min_link_api_level, gate.min_api_level)) return false;
     return switch (optimize) {
-        .Debug, .ReleaseSafe => true,
-        .ReleaseFast, .ReleaseSmall => false,
+        .debug, .safe => true,
+        .fast, .small => false,
     };
 }
 
@@ -869,7 +870,7 @@ fn apiBelowFloorMessage(
     b: *std.Build,
     step_name: []const u8,
     api_level: u32,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     gate: AbiGate,
 ) []const u8 {
     // An ABI whose own floor is above the generic one gets its own message.
@@ -956,6 +957,7 @@ fn apiBelowFloorMessage(
 /// would turn a diagnosable refusal here into a silent fall-through to the
 /// next source.
 fn isOnDisk(b: *std.Build, path: []const u8) bool {
+    b.dependOnFileMetadata(.{ .cwd_relative = path });
     _ = std.Io.Dir.cwd().statFile(b.graph.io, path, .{}) catch |err| {
         return err != error.FileNotFound;
     };
@@ -1133,7 +1135,8 @@ fn explicitOrUnset(b: *std.Build, explicit: ?[]const u8) []const u8 {
 /// hands out a `LazyPath` this script owns and compiles, which is what the
 /// compilations above want, and probing wants a plain path.
 fn fileExists(b: *std.Build, sub_path: []const u8) bool {
-    std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(sub_path), .{}) catch return false;
+    b.dependOnFileMetadata(b.path(sub_path));
+    b.root.access(b.graph.io, sub_path, .{}) catch return false;
     return true;
 }
 
@@ -1194,7 +1197,7 @@ pub const AndroidLinkOptions = struct {
     /// one would be a side effect the caller did not ask for, and a refusal
     /// that names the disagreement is more honest than a precedence rule
     /// nobody can see.
-    optimize: ?std.builtin.OptimizeMode = null,
+    optimize: ?std.lang.Optimize = null,
     /// Opt into the ABI-table cross-check, and only that.
     ///
     /// When true, this build script hands its own `abi_gates` table to the
@@ -1299,7 +1302,7 @@ pub fn linkAndroid(
     // `.ReleaseSmall` option passed the guard and then died in ld.lld with
     // `undefined symbol: preadv64`, which is the one failure this guard exists
     // to refuse up front.
-    const module_optimize = compile.root_module.optimize orelse std.builtin.OptimizeMode.Debug;
+    const module_optimize = compile.root_module.optimize orelse std.lang.Optimize.debug;
     if (options.optimize) |claimed| {
         if (claimed != module_optimize) {
             std.log.err(
@@ -1312,8 +1315,8 @@ pub fn linkAndroid(
                 \\to take the module's, or set the two to the same value:
                 \\
                 \\  .optimize = null,                         // use the module's
-                \\  .optimize = .ReleaseSmall,                // and set the module
-                \\  compile.root_module.optimize = .ReleaseSmall;
+                \\  .optimize = .small,                // and set the module
+                \\  compile.root_module.optimize = .small;
                 \\
             , .{ @tagName(claimed), @tagName(module_optimize) });
             return error.OptimizeMismatch;
@@ -1383,7 +1386,7 @@ pub fn linkAndroid(
     const helper_module = b.createModule(.{
         .root_source_file = gen.add("ndk_libc_file.zig", libc_file_helper_source),
         .target = b.graph.host,
-        .optimize = options.optimize orelse std.builtin.OptimizeMode.Debug,
+        .optimize = options.optimize orelse std.lang.Optimize.debug,
     });
     // The helper is the only thing in the build that may see the published
     // module, and it is the reason this file needs to know no NDK layout.
@@ -1418,7 +1421,7 @@ pub fn linkAndroid(
     // The helper takes its output path as the last argument, because
     // `addPrefixedOutputFileArg` concatenates the prefix and the path with no
     // separator and would produce `--out<path>`.
-    const libc_file = run_helper.addOutputFileArg("ndk-libc.txt");
+    const libc_file = run_helper.addOutputFileArg2("ndk-libc.txt", .{});
 
     compile.setLibCFile(libc_file);
     compile.root_module.link_libc = true;
@@ -1448,8 +1451,8 @@ fn addGateRows(b: *std.Build, run: *std.Build.Step.Run) void {
             @tagName(gate.zig_abi),
             b.fmt("{d}", .{gate.min_api_level}),
             @tagName(gate.cpu_arch),
-            b.fmt("{d}", .{@intFromEnum(gate.elf_class)}),
-            b.fmt("{d}", .{@intFromEnum(gate.elf_machine)}),
+            b.fmt("{d}", .{@backingInt(gate.elf_class)}),
+            b.fmt("{d}", .{@backingInt(gate.elf_machine)}),
         });
     }
 }
@@ -1981,12 +1984,12 @@ const elf_check_source =
     \\            const filesz = readField(phdr, @offsetOf(std.elf.Elf64.Phdr, "filesz"), @offsetOf(std.elf.Elf32.Phdr, "filesz"), is_64);
     \\            if (off + filesz > bytes.len) continue;
     \\            const body = bytes[@intCast(off)..][0..@intCast(filesz)];
-    \\            if (kind == std.elf.PT_INTERP and interp == null) {
+    \\            if (kind == @intFromEnum(std.elf.PT.INTERP) and interp == null) {
     \\                // The interpreter string is NUL-terminated and `filesz`
     \\                // includes that NUL, so the slice is trimmed rather than
     \\                // trusted to be exact.
     \\                interp = std.mem.trimEnd(u8, body, "\x00");
-    \\            } else if (kind == std.elf.PT_DYNAMIC and dynamic == null) {
+    \\            } else if (kind == @intFromEnum(std.elf.PT.DYNAMIC) and dynamic == null) {
     \\                dynamic = .{ .off = off, .len = filesz };
     \\            }
     \\        }
@@ -2145,7 +2148,7 @@ const elf_check_source =
     \\            const at: usize = @intCast(phoff + i * phentsize);
     \\            if (at + phentsize > bytes.len) return null;
     \\            const ph = bytes[at..][0..@intCast(phentsize)];
-    \\            if (readWord32(ph, @offsetOf(std.elf.Elf64.Phdr, "type")) != std.elf.PT_LOAD) continue;
+    \\            if (readWord32(ph, @offsetOf(std.elf.Elf64.Phdr, "type")) != @intFromEnum(std.elf.PT.LOAD)) continue;
     \\            const seg_off = readField(ph, @offsetOf(std.elf.Elf64.Phdr, "offset"), @offsetOf(std.elf.Elf32.Phdr, "offset"), is_64);
     \\            const seg_vaddr = readField(ph, @offsetOf(std.elf.Elf64.Phdr, "vaddr"), @offsetOf(std.elf.Elf32.Phdr, "vaddr"), is_64);
     \\            const seg_filesz = readField(ph, @offsetOf(std.elf.Elf64.Phdr, "filesz"), @offsetOf(std.elf.Elf32.Phdr, "filesz"), is_64);

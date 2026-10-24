@@ -349,18 +349,18 @@ test "an ABI name resolves back to exactly one ABI, and a near miss to none" {
 // 2. The libc paths file
 // ---------------------------------------------------------------------------
 
-test "the six-field libc paths file built from a resolved sysroot parses, and matches Zig's own bytes" {
+test "the seven-field libc paths file built from a resolved sysroot parses, and matches Zig's own bytes" {
     // This is the load-bearing test in the package.
-    // `std.zig.LibCInstallation.parse` rejects the file outright unless all six
+    // `std.zig.LibCInstallation.parse` rejects the file outright unless all seven
     // keys are present, and rejects it again for a non-Darwin target whose
     // `crt_dir` is empty. Neither is a subtle failure: the consumer's build
     // stops with "missing field" at the link step. A key that Android never
-    // uses — `msvc_lib_dir`, `kernel32_lib_dir`, `gcc_dir` — still has to be
+    // uses — `msvc_lib_dir`, `kernel32_lib_dir`, `darwin_sdk_dir` — still has to be
     // written, present and valueless, which is the one mistake that survives
     // every gate in this package because nothing here links anything.
     //
     // The bytes come from `LibcPaths`, the package's one renderer, and are then
-    // compared whole against `LibCInstallation.render` for the same six values
+    // compared whole against `LibCInstallation.render` for the same seven values
     // — which is what Zig itself writes for them. A dropped key, a reordered
     // key, or a value where an Android file wants none, is then a byte
     // difference caught here rather than a link failure on somebody else's
@@ -404,7 +404,7 @@ test "the six-field libc paths file built from a resolved sysroot parses, and ma
     try testing.expectEqualStrings(try path.join(gpa, &.{ tree, "35" }), crt_dir);
 
     // Rendered through the published renderer, not through a template written
-    // here. The six-field format has one home; a second copy in a test is how
+    // here. The seven-field format has one home; a second copy in a test is how
     // a second source of truth starts.
     var paths = try LibcPaths.forAndroid(gpa, include_dir, sys_include_dir, crt_dir);
     defer paths.deinit(gpa);
@@ -439,25 +439,22 @@ test "the six-field libc paths file built from a resolved sysroot parses, and ma
     // fields stay unset and `render` must write them present and valueless.
     try testing.expect(paths.msvc_lib_dir == null);
     try testing.expect(paths.kernel32_lib_dir == null);
-    try testing.expect(paths.gcc_dir == null);
+    try testing.expectEqualStrings(crt_dir, paths.cc_dir.?);
+    try testing.expect(paths.darwin_sdk_dir == null);
 
-    const fields = std.meta.fields(std.zig.LibCInstallation);
-    try testing.expectEqual(@as(usize, 6), fields.len);
+    const fields = @typeInfo(std.zig.LibCInstallation).@"struct".field_names;
+    try testing.expectEqual(@as(usize, 7), fields.len);
 
     const lines = try keyLines(gpa, text);
     try testing.expectEqual(fields.len, lines.len);
 
-    const values = [6][]const u8{ include_dir, sys_include_dir, crt_dir, "", "", "" };
-    // `inline for`, not `for`: `std.meta.fields` yields
-    // `builtin.Type.StructField`, whose `type` member exists only at comptime,
-    // so a runtime loop cannot even copy one element out of the slice. The key
-    // names are read from the compiler's own declaration of the struct, which
-    // is what keeps this file from carrying a second list of the six names.
-    inline for (fields, 0..) |field, i| {
-        try testing.expectEqualStrings(
-            try std.fmt.allocPrint(gpa, "{s}={s}", .{ field.name, values[i] }),
-            lines[i],
-        );
+    const values = [7][]const u8{ include_dir, sys_include_dir, crt_dir, "", "", crt_dir, "" };
+    inline for (fields, 0..) |field_name, i| {
+        try testing.expect(std.mem.indexOf(
+            u8,
+            text,
+            try std.fmt.allocPrint(gpa, "\n{s}={s}\n", .{ field_name, values[i] }),
+        ) != null);
     }
 
     // Line terminators, not just content: a generated file that lost its
@@ -478,7 +475,8 @@ test "the six-field libc paths file built from a resolved sysroot parses, and ma
     // the whole reason the three Windows and Haiku fields are written at all.
     try testing.expect(parsed.msvc_lib_dir == null);
     try testing.expect(parsed.kernel32_lib_dir == null);
-    try testing.expect(parsed.gcc_dir == null);
+    try testing.expectEqualStrings(crt_dir, parsed.cc_dir.?);
+    try testing.expect(parsed.darwin_sdk_dir == null);
 
     // And the whole document is what Zig itself would have written for those
     // values, comment header included.
@@ -1061,11 +1059,11 @@ test "a directory this process cannot read is a filesystem error, not a domain r
     // search permission. `setFilePermissions` is what `chmod 000` is on this
     // interface.
     const Permissions = Dir.Permissions;
-    try Dir.cwd().setFilePermissions(testing.io, tree, @as(Permissions, @enumFromInt(0)), .{});
+    try Dir.cwd().setFilePermissions(testing.io, tree, @as(Permissions, @fromBackingInt(@intCast(0))), .{});
     defer Dir.cwd().setFilePermissions(
         testing.io,
         tree,
-        @as(Permissions, @enumFromInt(0o755)),
+        @as(Permissions, @fromBackingInt(@intCast(0o755))),
         .{},
     ) catch {};
 

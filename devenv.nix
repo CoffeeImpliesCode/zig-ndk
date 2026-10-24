@@ -87,7 +87,7 @@ in
   # "unsupported attribute ... caused by introducing a top-level `config`".
   config = {
     packages = with pkgs; [
-      zig_0_16
+      zig_0_17
       ndk
       binutils
       # `llvmPackages_latest` and `llvmPackages_latest.bintools` are attribute

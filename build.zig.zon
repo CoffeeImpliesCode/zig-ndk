@@ -12,7 +12,7 @@
     // is not recorded by an artefact in this repository; treat it as an opaque
     // identifier rather than as a value with a verifiable derivation.
     .fingerprint = 0xdb4b4a79be9224ab,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

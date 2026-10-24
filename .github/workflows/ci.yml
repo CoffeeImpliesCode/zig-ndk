@@ -72,7 +72,7 @@ defaults:
     shell: bash
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
 
   # The Zig pin is not what the other two fields look like.
   #
@@ -677,7 +677,7 @@ jobs:
               // package of this name; a wrong one is not silent, Zig names the
               // right value in its own error.
               .fingerprint = 0x705b3727d964d897,
-              .minimum_zig_version = "0.16.0",
+              .minimum_zig_version = "0.17.0",
               .dependencies = .{
                   .zig_ndk = .{ .url = "file://$package", .hash = "$hash" },
               },
@@ -688,7 +688,7 @@ jobs:
           cat >"$consumer/build.zig" <<'BZ'
           const std = @import("std");
 
-          pub fn build(b: *std.Build) void {
+          pub fn build(b: *std.Build) !void {
               const target = b.standardTargetOptions(.{});
               const optimize = b.standardOptimizeOption(.{});
 

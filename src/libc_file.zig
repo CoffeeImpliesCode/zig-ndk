@@ -1,13 +1,13 @@
-//! Renders an Android NDK sysroot into the libc paths file that Zig 0.16.0's
+//! Renders an Android NDK sysroot into the libc paths file that Zig 0.17.0's
 //! `std.zig.LibCInstallation.parse` reads.
 //!
-//! Zig 0.16.0 ships no bionic. `zig build-exe -target aarch64-linux-android`
+//! Zig 0.17.0 ships no bionic. `zig build-exe -target aarch64-linux-android`
 //! links a freestanding binary, but the same command with `-lc` fails with
 //! "unable to provide libc" until the compiler is handed a libc paths file
 //! naming the NDK's headers and CRT objects. This module renders that file.
 //!
-//! The format is six `name=value` lines split on `\n`, with `#` starting a
-//! comment. Six fields, all six mandatory.
+//! The format is seven `name=value` lines split on `\n`, with `#` starting a
+//! comment. All seven fields are mandatory.
 
 const std = @import("std");
 
@@ -72,21 +72,19 @@ msvc_lib_dir: ?[]const u8 = null,
 /// Borrowed, not owned: see `msvc_lib_dir`.
 kernel32_lib_dir: ?[]const u8 = null,
 
-/// The directory that holds `crtbeginS.o` and `crtendS.o`. Haiku only.
-///
-/// Always `null` for Android. Written present-but-empty by `render`, for the
-/// same reason as `msvc_lib_dir`.
-///
-/// Borrowed, not owned: see `msvc_lib_dir`.
-gcc_dir: ?[]const u8 = null,
+/// The directory that holds compiler CRT objects. Borrows `crt_dir` for Android.
+cc_dir: ?[]const u8 = null,
+
+/// Darwin SDK directory. Borrowed and always null for Android.
+darwin_sdk_dir: ?[]const u8 = null,
 
 /// Describes an Android sysroot, ready to be rendered.
 ///
 /// The three paths this constructor takes are copied into the allocator passed
 /// in and released by `deinit` with that same allocator, so a `LibcPaths`
-/// outlives the strings it was built from. The three optional fields are left
-/// `null` here and are borrowed when a caller sets them; `deinit` does not
-/// free them.
+/// outlives the strings it was built from. `cc_dir` borrows the owned CRT path.
+/// The three platform-only fields remain null. Optional fields set by a caller
+/// are borrowed and are not freed separately.
 pub fn forAndroid(
     gpa: Allocator,
     include_dir: []const u8,
@@ -103,18 +101,15 @@ pub fn forAndroid(
         .include_dir = owned_include_dir,
         .sys_include_dir = owned_sys_include_dir,
         .crt_dir = owned_crt_dir,
+        .cc_dir = owned_crt_dir,
     };
 }
 
 /// Releases the three paths `forAndroid` copied and leaves `self` unusable.
 ///
 /// Must be called with the allocator that was passed to `forAndroid`, and it
-/// frees exactly what `forAndroid` copied — nothing else. `msvc_lib_dir`,
-/// `kernel32_lib_dir` and `gcc_dir` are borrowed: `forAndroid` leaves them
-/// `null`, a caller that sets one sets it to memory it owns, and `deinit` does
-/// not touch it. That they are `null` for Android is a property of the
-/// constructor, not of the type, so the guarantee here is about which fields
-/// `deinit` frees and not about what those fields currently hold.
+/// frees exactly what `forAndroid` copied. `cc_dir` aliases `crt_dir` by default.
+/// Optional field overrides are borrowed and are not freed separately.
 pub fn deinit(self: *LibcPaths, gpa: Allocator) void {
     gpa.free(self.include_dir);
     gpa.free(self.sys_include_dir);
@@ -122,18 +117,15 @@ pub fn deinit(self: *LibcPaths, gpa: Allocator) void {
     self.* = undefined;
 }
 
-/// Writes the six-field libc paths file that Zig reads.
+/// Writes the seven-field libc paths file that Zig reads.
 ///
 /// The layout, the comment block, the field order and the trailing newline are
 /// byte-for-byte those of `std.zig.LibCInstallation.render`, so a file written
 /// here is indistinguishable from one Zig writes itself and reads back through
 /// the same parser.
 ///
-/// All six keys are always written. A `null` field becomes a bare `name=` with
-/// an empty value, because `LibCInstallation.parse` requires every field to be
-/// present and only then complains about empty ones. Dropping
-/// `msvc_lib_dir`, `kernel32_lib_dir` or `gcc_dir` from an Android file is the
-/// one mistake that fails even though Android needs none of them.
+/// All seven keys are always written. A `null` field becomes a bare `name=`.
+/// Android needs both CRT directories. Windows and Darwin keys stay empty.
 ///
 /// The bytes stay owned by `out`. Nothing is allocated here, and `out` is not
 /// flushed.
@@ -141,17 +133,21 @@ pub fn render(self: LibcPaths, out: *std.Io.Writer) std.Io.Writer.Error!void {
     @setEvalBranchQuota(4000);
     try out.print(
         \\# The directory that contains `stdlib.h`.
-        \\# On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null`
+        \\# On POSIX, can be found with: `cc -E -Wp,-v -xc /dev/null`
         \\include_dir={s}
         \\
         \\# The system-specific include directory. May be the same as `include_dir`.
-        \\# On Windows it's the directory that includes `vcruntime.h`.
-        \\# On POSIX it's the directory that includes `sys/errno.h`.
+        \\# On Windows, it's the directory that includes `vcruntime.h`.
+        \\# On POSIX, it's the directory that includes `sys/errno.h`.
         \\sys_include_dir={s}
+        \\
+        \\# The directory that contains `crtbegin.o` and `crtend.o`. May be the same as `crt_dir`.
+        \\# On POSIX, can be found with `cc -print-file-name=crtbegin.o`.
+        \\# Only needed when targeting Haiku, Linux, or SerenityOS.
+        \\cc_dir={s}
         \\
         \\# The directory that contains `crt1.o` or `crt2.o`.
         \\# On POSIX, can be found with `cc -print-file-name=crt1.o`.
-        \\# Not needed when targeting MacOS.
         \\crt_dir={s}
         \\
         \\# The directory that contains `vcruntime.lib`.
@@ -162,17 +158,18 @@ pub fn render(self: LibcPaths, out: *std.Io.Writer) std.Io.Writer.Error!void {
         \\# Only needed when targeting MSVC on Windows.
         \\kernel32_lib_dir={s}
         \\
-        \\# The directory that contains `crtbeginS.o` and `crtendS.o`
-        \\# Only needed when targeting Haiku.
-        \\gcc_dir={s}
+        \\# The directory that contains `SDKSettings.json`
+        \\# Only needed when targeting Darwin.
+        \\darwin_sdk_dir={s}
         \\
     , .{
         self.include_dir,
         self.sys_include_dir,
+        self.cc_dir orelse "",
         self.crt_dir,
         self.msvc_lib_dir orelse "",
         self.kernel32_lib_dir orelse "",
-        self.gcc_dir orelse "",
+        self.darwin_sdk_dir orelse "",
     });
 }
 
@@ -203,15 +200,7 @@ fn renderAlloc(
 /// real NDK and never writes into the source tree. Whatever `gpa` hands back
 /// belongs to `gpa`.
 ///
-/// Pass an arena, not `testing.allocator`, when the parse is expected to
-/// succeed. `LibCInstallation.deinit` is broken at this compiler line: `parse`
-/// allocates each value with `dupeZ`, which takes one byte more than the value,
-/// and stores it in a `?[]const u8` field that drops the sentinel, so `deinit`
-/// frees a length one byte short of what was allocated and a bounds-checking
-/// allocator rejects it. An arena sidesteps that without this test depending on
-/// the upstream bug being fixed. The failure path inside `parse` is fine; its
-/// `errdefer` holds the sentinel-typed slice and frees the right length.
-/// Test helper.
+/// Pass an arena to own the parsed field values. Test helper.
 fn parseRendered(
     gpa: Allocator,
     text: []const u8,
@@ -264,10 +253,11 @@ test "forAndroid copies its three paths and leaves the platform trio unset" {
 
     try testing.expect(paths.msvc_lib_dir == null);
     try testing.expect(paths.kernel32_lib_dir == null);
-    try testing.expect(paths.gcc_dir == null);
+    try testing.expectEqualStrings(crt, paths.cc_dir.?);
+    try testing.expect(paths.darwin_sdk_dir == null);
 }
 
-test "deinit frees what forAndroid copied and never the three borrowed fields" {
+test "deinit frees copied paths and never optional field overrides" {
     var paths = try LibcPaths.forAndroid(testing.allocator, "/inc", "/inc", "/crt");
 
     // String literals on purpose: a caller naming a Windows or Haiku directory
@@ -277,7 +267,8 @@ test "deinit frees what forAndroid copied and never the three borrowed fields" {
     // ever grows into `deinit`.
     paths.msvc_lib_dir = "/win/vc/lib";
     paths.kernel32_lib_dir = "/win/sdk/lib";
-    paths.gcc_dir = "/haiku/lib";
+    paths.cc_dir = "/haiku/lib";
+    paths.darwin_sdk_dir = "/darwin/sdk";
 
     // A non-null field must still reach the file: borrowed is a statement
     // about `deinit`, not about `render` silently dropping the value.
@@ -288,12 +279,13 @@ test "deinit frees what forAndroid copied and never the three borrowed fields" {
 
     try testing.expect(std.mem.indexOf(u8, text, "\nmsvc_lib_dir=/win/vc/lib\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\nkernel32_lib_dir=/win/sdk/lib\n") != null);
-    try testing.expect(std.mem.endsWith(u8, text, "\ngcc_dir=/haiku/lib\n"));
+    try testing.expect(std.mem.indexOf(u8, text, "\ncc_dir=/haiku/lib\n") != null);
+    try testing.expect(std.mem.endsWith(u8, text, "\ndarwin_sdk_dir=/darwin/sdk\n"));
 
     paths.deinit(testing.allocator);
 }
 
-test "render writes all six keys, each carrying the value it was given" {
+test "render writes all seven keys, each carrying the value it was given" {
     // Two DIFFERENT directories for the two include keys. Android itself passes
     // the same directory twice, which is why a renderer that wrote
     // `sys_include_dir` under `include_dir` and the reverse would be
@@ -310,7 +302,7 @@ test "render writes all six keys, each carrying the value it was given" {
     );
     defer testing.allocator.free(text);
 
-    // All six keys are present on their own line. Order and exact layout are
+    // All seven keys are present on their own line. Order and exact layout are
     // pinned byte-for-byte by the next test; this one only counts the keys the
     // parser refuses to do without. The leading newline keeps
     // "include_dir=" from matching inside "sys_include_dir=".
@@ -320,7 +312,8 @@ test "render writes all six keys, each carrying the value it was given" {
         "crt_dir=",
         "msvc_lib_dir=",
         "kernel32_lib_dir=",
-        "gcc_dir=",
+        "cc_dir=",
+        "darwin_sdk_dir=",
     }) |key| {
         // The needle is the key at the start of a line, not a whole line: the
         // three valued keys are followed by their value, not by a newline.
@@ -359,17 +352,21 @@ test "render is byte-for-byte the layout Zig itself writes" {
 
     const expected =
         \\# The directory that contains `stdlib.h`.
-        \\# On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null`
+        \\# On POSIX, can be found with: `cc -E -Wp,-v -xc /dev/null`
         \\include_dir=/inc
         \\
         \\# The system-specific include directory. May be the same as `include_dir`.
-        \\# On Windows it's the directory that includes `vcruntime.h`.
-        \\# On POSIX it's the directory that includes `sys/errno.h`.
+        \\# On Windows, it's the directory that includes `vcruntime.h`.
+        \\# On POSIX, it's the directory that includes `sys/errno.h`.
         \\sys_include_dir=/sys-inc
+        \\
+        \\# The directory that contains `crtbegin.o` and `crtend.o`. May be the same as `crt_dir`.
+        \\# On POSIX, can be found with `cc -print-file-name=crtbegin.o`.
+        \\# Only needed when targeting Haiku, Linux, or SerenityOS.
+        \\cc_dir=/crt
         \\
         \\# The directory that contains `crt1.o` or `crt2.o`.
         \\# On POSIX, can be found with `cc -print-file-name=crt1.o`.
-        \\# Not needed when targeting MacOS.
         \\crt_dir=/crt
         \\
         \\# The directory that contains `vcruntime.lib`.
@@ -380,9 +377,9 @@ test "render is byte-for-byte the layout Zig itself writes" {
         \\# Only needed when targeting MSVC on Windows.
         \\kernel32_lib_dir=
         \\
-        \\# The directory that contains `crtbeginS.o` and `crtendS.o`
-        \\# Only needed when targeting Haiku.
-        \\gcc_dir=
+        \\# The directory that contains `SDKSettings.json`
+        \\# Only needed when targeting Darwin.
+        \\darwin_sdk_dir=
         \\
     ;
     try testing.expectEqualStrings(expected, text);
@@ -398,7 +395,7 @@ test "render output is accepted by the parser that will read it" {
 
     const target = try androidTarget();
 
-    // An arena, because LibCInstallation.deinit miscounts; see parseRendered.
+    // The arena owns the parsed strings.
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const parsed = try parseRendered(arena.allocator(), text, &target);
@@ -412,7 +409,8 @@ test "render output is accepted by the parser that will read it" {
     // parse maps an empty value to null; the file still carries the key.
     try testing.expect(parsed.msvc_lib_dir == null);
     try testing.expect(parsed.kernel32_lib_dir == null);
-    try testing.expect(parsed.gcc_dir == null);
+    try testing.expectEqualStrings(crt, parsed.cc_dir.?);
+    try testing.expect(parsed.darwin_sdk_dir == null);
 }
 
 // There is deliberately no test here that asserts `parse` REJECTS a
@@ -420,5 +418,5 @@ test "render output is accepted by the parser that will read it" {
 // `log.err` before it returns, and Zig's test runner fails a run that logged an
 // error, so such a test cannot assert what it wants without also failing the
 // gate. What that test would prove is std's rule, not this module's: the two
-// obligations this module owns are covered above, namely that all six keys are
+// obligations this module owns are covered above, namely that all seven keys are
 // emitted and that the result parses.
