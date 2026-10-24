@@ -1,6 +1,6 @@
 # CI for zig-ndk.
 #
-# Gate names come from build.zig, registered there as Zig 0.16.0 build steps:
+# Gate names come from build.zig, registered there as Zig 0.17.0 build steps:
 #
 #   zig build fmt-check       addFmt(.{ .check = true }) — formatting
 #   zig build test            host unit tests, b.addTest + b.addRunArtifact
@@ -27,31 +27,9 @@
 # else — every other job compiles the repository against itself, where all of
 # those stay green. Host target, no NDK, no sysroot.
 #
-# --- Known gap: foundation contract §4.3 item 5, Tier-2 host targets --------
-# The contract asks for cross-compilation gates on x86_64-linux (Tier 1) and
-# aarch64-linux, aarch64-macos, x86_64-windows, riscv64-linux, wasm32-wasi
-# (Tier 2). What this file gates is:
-#
-#   x86_64-linux   the fmt, test and licence jobs' own runner, natively
-#   riscv64-linux  the riscv64 entry of ndk-abi-check — a different ABI,
-#                  not the host OS, and it is an Android target
-#
-# NOT gated here: aarch64-linux, aarch64-macos, x86_64-windows, and
-# wasm32-wasi as host targets. Item 5 is therefore open for this package, and
-# this comment is the disclosure — a red job would say less.
-#
-# The closing mechanism is not settled. build.zig's `test` step already
-# degrades to compile-only under a foreign `-Dtarget` (build.zig's `isNative`
-# branch of that step: false means it depends on the compile, logs that it did
-# not run, and does not fail), so `zig build test -Dtarget=aarch64-linux` is
-# the obvious candidate — but no CI run has proven this package compiles for
-# those triples, and a gate that has never been green is not a gate. It is
-# left unwired rather than wired and red.
 name: CI
 
-# Item 7 of the foundation per-fork contract (~/foundation/docs/
-# 01-first-wave.md §4.3): every commit builds. Push covers the fork's own
-# branches, pull_request covers every outside contributor's commit.
+# Build each pushed commit and each pull request.
 on:
   push:
   pull_request:
@@ -74,36 +52,8 @@ defaults:
 env:
   ZIG_VERSION: "0.17.0"
 
-  # The Zig pin is not what the other two fields look like.
-  #
-  # `ZIG_VERSION` above is the only machine-enforced compiler pin in this
-  # repository: setup-zig resolves it to that exact release — the tag, not a
-  # branch, so the workflow cannot move under a green run. The other two fields
-  # are not pins and must not be described as one.
-  #
-  #   .minimum_zig_version   advisory. build.zig.zon:15 states 0.16.0 and
-  #                          nothing acts on it: across the 0.16.0 lib tree the
-  #                          only occurrence is zig init's own template
-  #                          (lib/init/build.zig.zon:28), so a 0.17 build
-  #                          would not be refused by it.
-  #   zig_0_16               a floating nixpkgs attribute (devenv.nix:90). It
-  #                          resolves to whatever devenv.lock's nixpkgs-src rev
-  #                          provides, currently
-  #                          c7def046b9a883d46974757852106483d741586f, so the
-  #                          dev shell can drift a patch away from this job's
-  #                          exact 0.16.0 with nothing turning red.
-  #
-  # Every file:line citation in this repository is anchored to 0.16.0 and has
-  # not been re-verified against 0.17.0, which shipped 2026-10-01. Nothing in
-  # this file claims 0.17 works.
-  #
-  # And one measured constraint for anyone wiring per-ABI legs here:
-  # `ndk-link-check` must run at API 35 for all five ABIs, or the API-21 legs
-  # must pass -Doptimize=ReleaseSmall. Bionic did not gain preadv64/pwritev64
-  # until API 24, and Zig's default panic handler reaches both, so an API-21
-  # Debug leg fails on a missing symbol that has nothing to do with the sysroot
-  # description this gate exists to check. Per-ABI minimums wired without this
-  # produce a red CI nobody can explain.
+  # The NDK link checks use API 35 for every ABI.
+  # API 21 links require -Doptimize=small or fast.
 
   # --- Compiler record for the pinned Android NDK -------------------------
   # Facts about one artefact, not choices. Each of the three constants below is

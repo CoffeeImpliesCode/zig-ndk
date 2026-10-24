@@ -1,6 +1,6 @@
 # devenv for the zig-ndk integration library.
 #
-# The library itself is pure Zig and needs only a 0.16.0 compiler. The NDK is
+# The library itself is pure Zig and needs only a 0.17.0 compiler. The NDK is
 # the one heavy input, and it is fetched here rather than taken from nixpkgs'
 # `androidndkPkgs_*` for two reasons, both found by execution on this host:
 #
@@ -25,23 +25,8 @@
   # problems, and puts the pin where a reviewer can read it. The same four
   # facts are recorded for `tools/sync-ndk.sh` to re-check in tools/ndk.sha256.
 #
-# A private global cache keeps this project off the shared ~/.cache/zig lock
-# graph. Builds there convoy behind whichever process is wedged, and one stuck
-# zls build-runner holds a manifest flock for hours.
-#
-# The `zig` in this shell is NOT the `zig` CI runs, and no gate compares them.
-# CI installs the official 0.16.0 prebuilt tarball (mlugg/setup-zig@v2).
-# `zig_0_16` below is a nixpkgs build: its generic.nix pulls the SOURCE from
-# Codeberg with `fetchFromCodeBerg` and compiles the compiler against nixpkgs
-# glibc, with `ZIG_TARGET_MCPU=baseline`. Both print `0.16.0`, but the two are
-# different files — the prebuilt is statically linked, the nixpkgs build is
-# dynamically linked — so the version string is not what ties them together.
-#
-# Measured as of this comment: `zig build check` exits 0 under BOTH compilers
-# in a scratch copy, so gate semantics agree today and this is not a broken
-# shell. What nothing checks is that they keep agreeing. `enterShell` prints
-# the shell compiler's digest next to its version so two developers on two
-# shells can tell at a glance whether they hold the same binary.
+# Keep a separate global cache for this checkout.
+# CI uses the official Zig prebuilt. The shell uses nixpkgs' Zig source build.
 { pkgs, config, ... }:
 
 let

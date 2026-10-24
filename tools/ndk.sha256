@@ -58,8 +58,7 @@
 #
 # `tools/sync-ndk.sh` re-resolves all five, fails if any is missing and fails if
 # any moves, and requires the unpacked tree to agree with the archive the
-# digests are taken from. A new line here is not a formality: see CHANGELOG.md,
-# which records every fact in this file as something an NDK bump has to revisit.
+# digests are taken from. Revisit every recorded fact when changing the NDK pin.
 #
 # One further fact is deliberately NOT here, because it can vanish: the per-ABI
 # `min_os_version` in meta/abis.json. It is PRESENT in the pinned r29 -- all five

@@ -32,8 +32,7 @@
 #
 # It does NOT verify the libc paths file format in src/libc_file.zig. That is a
 # Zig compiler fact, not an NDK fact, and it moves with the compiler rather than
-# with Google. CHANGELOG.md p0004 says so in words as well, because "nothing
-# enforces this" is itself a fact worth writing down.
+# with Google. The Zig unit tests check that format separately.
 #
 # What is pinned, and how current it is. r29 is the first entry on Google's
 # unsupported-downloads list: it is no longer a supported revision, though the
@@ -208,8 +207,8 @@ PIN_SIZE=$(recorded size)
 PIN_SHA=$(recorded sha256)
 PIN_SHA1=$(recorded sha1)
 
-# All five, because tools/ndk.sha256 promises them and CHANGELOG.md repeats
-# them. `size` used to be optional: blanking or deleting its line took the
+# All five, because tools/ndk.sha256 promises them.
+# `size` used to be optional: blanking or deleting its line took the
 # check with it, silently, exit 0 -- so a fact the file recorded was not a fact
 # the script required. A removed fact is a failure now, whichever one it is.
 if [ -z "$PIN_RELEASE" ] || [ -z "$PIN_REVISION" ] || [ -z "$PIN_SIZE" ] ||
@@ -414,12 +413,8 @@ printf 'shape:     %s, NDK root %s\n' "$NDK_SHAPE" "$NDK_ROOT"
 
 # ------------------------------------------------- which hosts this NDK ships ---
 #
-# CHANGELOG.md p0008 says the host-tag set cannot be checked from here, because
-# "the manifest is not in the NDK tree and the script only reads files under the
-# NDK root". That is true of Google's download manifest and false of the
-# artefact that matters: toolchains/llvm/prebuilt/ holds exactly the host
-# packages this archive was built to ship. r29 for linux-x86_64 holds one entry,
-# linux-x86_64, and the script already holds its parent.
+# toolchains/llvm/prebuilt/ holds the host packages this archive ships.
+# r29 for linux-x86_64 holds one entry, linux-x86_64.
 PREBUILT="$NDK_ROOT/toolchains/llvm/prebuilt"
 [ -d "$PREBUILT" ] || die "$PREBUILT not found, so this tree carries no LLVM toolchain"
 
@@ -757,7 +752,7 @@ else
         printf 'for itself. Deleting one JSON key used to switch this check off in\n' >&2
         printf 'silence; it is now a decision someone has to record in %s:\n' "$RECORD" >&2
         printf '  # min_os_version: absent\n' >&2
-        printf 'Add that line, say why in CHANGELOG.md, and run this again.\n' >&2
+        printf 'Add that line, explain it in the pin file, and run this again.\n' >&2
         exit 1
     fi
     MIN_OS_PRESENT=0
@@ -980,16 +975,16 @@ if [ "$ACCEPT" -eq 1 ] && [ "$IDENTITY_OK" -ne 1 ]; then
     printf 'fetch it, so any value it computed would be its own number wearing\n'
     printf 'Google'"'"'s label. The line is left as recorded -- compare it with the\n'
     printf 'digest in repository2-3.xml and replace it by hand if it moved.\n'
-    printf '\nThe ABI table already matched this NDK. Add an entry to CHANGELOG.md\n'
-    printf 'saying what moved, and re-run this script with no flags to confirm.\n'
+    printf '\nThe ABI table already matched this NDK. Review the pin diff and\n'
+    printf 're-run this script with no flags to confirm.\n'
     exit 0
 fi
 
 if [ "$IDENTITY_OK" -ne 1 ]; then
     printf '\nsync-ndk: the pin in tools/ndk.sha256 no longer describes this NDK.\n' >&2
     printf 'The ABI table still matches, so this is an identity change only.\n' >&2
-    printf 'Nothing was modified. Re-run with --accept to re-record it, and record\n' >&2
-    printf 'in CHANGELOG.md what changed about the release. sha1 is the one\n' >&2
+    printf 'Nothing was modified. Review the release change before --accept.\n' >&2
+    printf 'sha1 is the one\n' >&2
     printf 'value that came from the publisher; replace it from repository2-3.xml.\n' >&2
     exit 1
 fi

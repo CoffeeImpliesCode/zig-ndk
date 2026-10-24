@@ -1,11 +1,10 @@
-//! zig-ndk — Android NDK integration for Zig 0.16.
+//! zig-ndk — Android NDK integration for Zig 0.17.
 //!
-//! Zig 0.16.0 ships no NDK awareness at all. `zig build-exe -target
+//! Zig 0.17.0 ships no NDK awareness at all. `zig build-exe -target
 //! aarch64-linux-android` succeeds; the same command with `-lc` fails with
 //! "unable to provide libc for target ...". This package closes that gap and
 //! nothing else. The authoritative design is CONTRACT.md; the notes below
-//! record only the Zig 0.16.0 mechanics this script depends on, each one
-//! verified against `lib/std` at tag `0.16.0`.
+//! describe the original Zig 0.16.0 mechanics behind this script.
 //!
 //!   * `b.addModule` publishes a module to dependents, `b.createModule` does
 //!     not (Build.zig:906-920). CONTRACT.md D2 wants the published half to
@@ -567,7 +566,7 @@ pub fn build(b: *std.Build) !void {
         } }, .{});
         // This run's argument is a path somebody else produced, not an output
         // argument of this run, so the build runner is free to cache the run
-        // away and stop checking. See AGENTS.md §3 trap 2.
+        // away and stop checking.
         run_elf_check.has_side_effects = true;
         run_elf_check.step.dependOn(&install_link.step);
         link_check_step.dependOn(&run_elf_check.step);

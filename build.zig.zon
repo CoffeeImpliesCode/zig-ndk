@@ -24,7 +24,6 @@
         "test/integration_test.zig",
         "README.md",
         "LICENSE",
-        "CHANGELOG.md",
         "CONTRACT.md",
         "tools/sync-ndk.sh",
         "tools/ndk.sha256",
