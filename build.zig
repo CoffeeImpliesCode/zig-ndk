@@ -928,7 +928,7 @@ fn apiBelowFloorMessage(
         \\which names a substitute symbol and neither of the two knobs that
         \\decide it. Two ways out, either one:
         \\
-        \\  zig build {s} -Dapi={d} -Doptimize=ReleaseSmall   (or ReleaseFast)
+        \\  zig build {s} -Dapi={d} -Doptimize=small   (or fast)
         \\  zig build {s} -Dapi={d}
         \\
         \\A `linkAndroid` caller sets the same two values in their own build
@@ -942,7 +942,7 @@ fn apiBelowFloorMessage(
         gate.triple,
         api_level,
         step_name,
-        min_link_api_level,
+        api_level,
         step_name,
         min_link_api_level,
     });
@@ -1164,7 +1164,7 @@ pub const AndroidLinkOptions = struct {
     /// Both ways of spelling the two knobs, because both audiences hit this:
     ///
     ///   * `zig build ndk-link-check -Dapi=21` links at
-    ///     `-Doptimize=ReleaseSmall` (or `ReleaseFast`), or at `-Dapi=24` and
+    ///     `-Doptimize=small` (or `fast`), or at `-Dapi=24` and
     ///     up in any mode.
     ///   * A `linkAndroid` caller sets `.api_level` here and `.optimize` on
     ///     their own module. Neither is a `-D` flag: this package's build
